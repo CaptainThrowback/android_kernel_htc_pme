@@ -2749,6 +2749,11 @@ int wl_android_priv_cmd(struct net_device *net, struct ifreq *ifr, int cmd)
 		goto exit;
 	}
 
+	if (!capable(CAP_NET_ADMIN)) {
+		ret = -EPERM;
+		goto exit;
+	}
+
 #ifdef CONFIG_COMPAT
 	if (is_compat_task()) {
 		compat_android_wifi_priv_cmd compat_priv_cmd;
@@ -3914,6 +3919,9 @@ void wlan_lock_irq_affinity(struct net_device *dev, int set)
 	dhd_irq_affinity_enable(dev, set);
 #ifdef SET_RPS_CPUS
 	dhd_rps_cpus_enable(dev, set);
+#endif
+#ifdef CUSTOMER_HW_ONE
+	dhd_tcpack_suppress_dynamic_enable(dev, set);
 #endif
 }
 
