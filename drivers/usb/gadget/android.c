@@ -4707,8 +4707,6 @@ static int android_probe(struct platform_device *pdev)
 		if (!ret)
 			pdata->usb_core_id = usb_core_id;
 
-		pdata->cdrom = of_property_read_bool(pdev->dev.of_node,
-				"qcom,android-usb-cdrom");
 		ret = of_property_read_u32(pdev->dev.of_node,
 				"htc,android-usb-nluns",
 				&pdata->nluns);
