@@ -5166,8 +5166,6 @@ static int android_probe(struct platform_device *pdev)
 			pdata->usb_core_id = usb_core_id;
 
 /*++ 2015/10/27, USB Team, PCN00001 ++*/
-		pdata->cdrom = of_property_read_bool(pdev->dev.of_node,
-				"qcom,android-usb-cdrom");
 		ret = of_property_read_u32(pdev->dev.of_node,
 				"htc,android-usb-nluns",
 				&pdata->nluns);
