@@ -105,19 +105,19 @@ static struct bin_attribute attr_data = {
 
 static struct device_attribute attrs[] = {
 	__ATTR(open, S_IWUSR,
-			synaptics_rmi4_show_error,
+			NULL,
 			rmidev_sysfs_open_store),
 	__ATTR(release, S_IWUSR,
-			synaptics_rmi4_show_error,
+			NULL,
 			rmidev_sysfs_release_store),
 	__ATTR(attn_state, S_IRUGO,
 			rmidev_sysfs_attn_state_show,
-			synaptics_rmi4_store_error),
+			NULL),
 	__ATTR(pid, S_IRUGO | S_IWUSR,
 			rmidev_sysfs_pid_show,
 			rmidev_sysfs_pid_store),
 	__ATTR(term, S_IWUSR,
-			synaptics_rmi4_show_error,
+			NULL,
 			rmidev_sysfs_term_store),
 	__ATTR(intr_mask, S_IRUGO | S_IWUSR,
 			rmidev_sysfs_intr_mask_show,
@@ -483,15 +483,20 @@ static ssize_t rmidev_read(struct file *filp, char __user *buf,
 		return -EBADF;
 	}
 
-	if (count == 0)
-		return 0;
+	mutex_lock(&(dev_data->file_mutex));
 
+	if (*f_pos > REG_ADDR_LIMIT) {
+		retval = -EFAULT;
+		goto clean_up;
+	}
 	if (count > (REG_ADDR_LIMIT - *f_pos))
 		count = REG_ADDR_LIMIT - *f_pos;
+	if (count == 0) {
+		retval = 0;
+		goto clean_up;
+	}
 
 	rmidev_allocate_buffer(count);
-
-	mutex_lock(&(dev_data->file_mutex));
 
 	retval = synaptics_rmi4_reg_read(rmidev->rmi4_data,
 			*f_pos,
@@ -530,18 +535,25 @@ static ssize_t rmidev_write(struct file *filp, const char __user *buf,
 		return -EBADF;
 	}
 
-	if (count == 0)
-		return 0;
+	mutex_lock(&(dev_data->file_mutex));
 
+	if (*f_pos > REG_ADDR_LIMIT) {
+		retval = -EFAULT;
+		goto unlock;
+	}
 	if (count > (REG_ADDR_LIMIT - *f_pos))
 		count = REG_ADDR_LIMIT - *f_pos;
+	if (count == 0) {
+		retval = 0;
+		goto unlock;
+	}
 
 	rmidev_allocate_buffer(count);
 
-	if (copy_from_user(rmidev->tmpbuf, buf, count))
-		return -EFAULT;
-
-	mutex_lock(&(dev_data->file_mutex));
+	if (copy_from_user(rmidev->tmpbuf, buf, count)) {
+		retval = -EFAULT;
+		goto unlock;
+	}
 
 	retval = synaptics_rmi4_reg_write(rmidev->rmi4_data,
 			*f_pos,
@@ -550,8 +562,8 @@ static ssize_t rmidev_write(struct file *filp, const char __user *buf,
 	if (retval >= 0)
 		*f_pos += retval;
 
+unlock:
 	mutex_unlock(&(dev_data->file_mutex));
-
 	return retval;
 }
 

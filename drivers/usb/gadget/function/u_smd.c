@@ -1,7 +1,7 @@
 /*
  * u_smd.c - utilities for USB gadget serial over smd
  *
- * Copyright (c) 2011, 2013-2016, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011, 2013-2017, The Linux Foundation. All rights reserved.
  *
  * This code also borrows from drivers/usb/gadget/u_serial.c, which is
  * Copyright (C) 2000 - 2003 Al Borchers (alborchers@steinerpoint.com)
@@ -74,6 +74,9 @@ struct gsmd_port {
 	struct delayed_work	connect_work;
 	struct work_struct	disconnect_work;
 
+	/* At present, smd does not notify
+	 * control bit change info from modem
+	 */
 	struct work_struct	update_modem_ctrl_sig;
 
 #define SMD_ACM_CTRL_DTR		0x01
@@ -86,7 +89,7 @@ struct gsmd_port {
 #define SMD_ACM_CTRL_RI		0x08
 	unsigned		cbits_to_laptop;
 
-	
+	/* pkt counters */
 	unsigned long		nbytes_tomodem;
 	unsigned long		nbytes_tolaptop;
 	bool			is_suspended;
@@ -146,7 +149,7 @@ static int gsmd_alloc_requests(struct usb_ep *ep, struct list_head *head,
 	int i;
 	struct usb_request *req;
 
-	pr_debug("%s: ep:%p head:%p num:%d size:%d cb:%p", __func__,
+	pr_debug("%s: ep:%pK head:%pK num:%d size:%d cb:%pK", __func__,
 			ep, head, num, size, cb);
 
 	for (i = 0; i < num; i++) {
@@ -196,7 +199,7 @@ static void gsmd_start_rx(struct gsmd_port *port)
 		spin_lock_irqsave(&port->port_lock, flags);
 		if (ret) {
 			pr_err("%s: usb ep out queue failed"
-					"port:%p, port#%d\n",
+					"port:%pK, port#%d\n",
 					 __func__, port, port->port_num);
 			list_add_tail(&req->list, pool);
 			break;
@@ -212,7 +215,7 @@ static void gsmd_rx_push(struct work_struct *w)
 	struct smd_port_info *pi = port->pi;
 	struct list_head *q;
 
-	pr_debug("%s: port:%p port#%d", __func__, port, port->port_num);
+	pr_debug("%s: port:%pK port#%d", __func__, port, port->port_num);
 
 	spin_lock_irq(&port->port_lock);
 
@@ -225,15 +228,15 @@ static void gsmd_rx_push(struct work_struct *w)
 
 		switch (req->status) {
 		case -ESHUTDOWN:
-			pr_debug("%s: req status shutdown portno#%d port:%p\n",
+			pr_debug("%s: req status shutdown portno#%d port:%pK\n",
 					__func__, port->port_num, port);
 			goto rx_push_end;
 		default:
-			pr_warning("%s: port:%p port#%d"
+			pr_warning("%s: port:%pK port#%d"
 					" Unexpected Rx Status:%d\n", __func__,
 					port, port->port_num, req->status);
 		case 0:
-			
+			/* normal completion */
 			break;
 		}
 
@@ -285,7 +288,7 @@ static void gsmd_read_pending(struct gsmd_port *port)
 	if (!port || !port->pi->ch)
 		return;
 
-	
+	/* passing null buffer discards the data */
 	while ((avail = smd_read_avail(port->pi->ch)))
 		smd_read(port->pi->ch, 0, avail);
 
@@ -302,7 +305,7 @@ static void gsmd_tx_pull(struct work_struct *w)
 	struct usb_ep *in;
 	int ret;
 
-	pr_debug("%s: port:%p port#%d pool:%p\n", __func__,
+	pr_debug("%s: port:%pK port#%d pool:%pK\n", __func__,
 			port, port->port_num, pool);
 
 	spin_lock_irq(&port->port_lock);
@@ -362,9 +365,9 @@ static void gsmd_tx_pull(struct work_struct *w)
 		spin_lock_irq(&port->port_lock);
 		if (ret) {
 			pr_err("%s: usb ep in queue failed"
-					"port:%p, port#%d err:%d\n",
+					"port:%pK, port#%d err:%d\n",
 					__func__, port, port->port_num, ret);
-			
+			/* could be usb disconnected */
 			if (!port->port_usb)
 				gsmd_free_req(in, req);
 			else
@@ -376,7 +379,7 @@ static void gsmd_tx_pull(struct work_struct *w)
 	}
 
 tx_pull_end:
-	
+	/* TBD: Check how code behaves on USB bus suspend */
 	if (port->port_usb && smd_read_avail(port->pi->ch) && !list_empty(pool))
 		queue_work(gsmd_wq, &port->pull);
 
@@ -389,7 +392,7 @@ static void gsmd_read_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct gsmd_port *port = ep->driver_data;
 
-	pr_debug("%s: ep:%p port:%p\n", __func__, ep, port);
+	pr_debug("%s: ep:%pK port:%pK\n", __func__, ep, port);
 
 	if (!port) {
 		pr_err("%s: port is null\n", __func__);
@@ -415,7 +418,7 @@ static void gsmd_write_complete(struct usb_ep *ep, struct usb_request *req)
 {
 	struct gsmd_port *port = ep->driver_data;
 
-	pr_debug("%s: ep:%p port:%p\n", __func__, ep, port);
+	pr_debug("%s: ep:%pK port:%pK\n", __func__, ep, port);
 
 	if (!port) {
 		pr_err("%s: port is null\n", __func__);
@@ -431,7 +434,7 @@ static void gsmd_write_complete(struct usb_ep *ep, struct usb_request *req)
 	}
 
 	if (req->status)
-		pr_warning("%s: port:%p port#%d unexpected %s status %d\n",
+		pr_warning("%s: port:%pK port#%d unexpected %s status %d\n",
 				__func__, port, port->port_num,
 				ep->name, req->status);
 
@@ -446,7 +449,7 @@ static void gsmd_start_io(struct gsmd_port *port)
 {
 	int		ret = -ENODEV;
 
-	pr_debug("%s: port: %p\n", __func__, port);
+	pr_debug("%s: port: %pK\n", __func__, port);
 
 	spin_lock(&port->port_lock);
 
@@ -491,7 +494,7 @@ static unsigned int convert_uart_sigs_to_acm(unsigned uart_sig)
 {
 	unsigned int acm_sig = 0;
 
-	
+	/* should this needs to be in calling functions ??? */
 	uart_sig &= (TIOCM_RI | TIOCM_CD | TIOCM_DSR);
 
 	if (uart_sig & TIOCM_RI)
@@ -508,7 +511,7 @@ static unsigned int convert_acm_sigs_to_uart(unsigned acm_sig)
 {
 	unsigned int uart_sig = 0;
 
-	
+	/* should this needs to be in calling functions ??? */
 	acm_sig &= (SMD_ACM_CTRL_DTR | SMD_ACM_CTRL_RTS);
 
 	if (acm_sig & SMD_ACM_CTRL_DTR)
@@ -601,7 +604,7 @@ static void gsmd_connect_work(struct work_struct *w)
 	port = container_of(w, struct gsmd_port, connect_work.work);
 	pi = port->pi;
 
-	pr_debug("%s: port:%p port#%d\n", __func__, port, port->port_num);
+	pr_debug("%s: port:%pK port#%d\n", __func__, port, port->port_num);
 
 	if (!test_bit(CH_READY, &pi->flags))
 		return;
@@ -610,7 +613,7 @@ static void gsmd_connect_work(struct work_struct *w)
 				&pi->ch, port, gsmd_notify);
 	if (ret) {
 		if (ret == -EAGAIN) {
-			
+			/* port not ready  - retry */
 			pr_debug("%s: SMD port not ready - rescheduling:%s err:%d\n",
 					__func__, pi->name, ret);
 			queue_delayed_work(gsmd_wq, &port->connect_work,
@@ -630,7 +633,7 @@ static void gsmd_disconnect_work(struct work_struct *w)
 	port = container_of(w, struct gsmd_port, disconnect_work);
 	pi = port->pi;
 
-	pr_debug("%s: port:%p port#%d\n", __func__, port, port->port_num);
+	pr_debug("%s: port:%pK port#%d\n", __func__, port, port->port_num);
 
 	smd_close(port->pi->ch);
 	port->pi->ch = NULL;
@@ -661,14 +664,14 @@ static void gsmd_notify_modem(void *gptr, u8 portno, int ctrl_bits)
 
 	port->cbits_to_modem = temp;
 
-	
+	/* usb could send control signal before smd is ready */
 	if (!test_bit(CH_OPENED, &port->pi->flags))
 		return;
 
 	pr_debug("%s: ctrl_tomodem:%d DTR:%d  RST:%d\n", __func__, ctrl_bits,
 		ctrl_bits & SMD_ACM_CTRL_DTR ? 1 : 0,
 		ctrl_bits & SMD_ACM_CTRL_RTS ? 1 : 0);
-	
+	/* if DTR is high, update latest modem info to laptop */
 	if (port->cbits_to_modem & TIOCM_DTR) {
 		unsigned i;
 
@@ -698,7 +701,7 @@ int gsmd_connect(struct gserial *gser, u8 portno)
 	int ret;
 	struct gsmd_port *port;
 
-	pr_debug("%s: gserial:%p portno:%u\n", __func__, gser, portno);
+	pr_debug("%s: gserial:%pK portno:%u\n", __func__, gser, portno);
 
 	if (portno >= n_smd_ports) {
 		pr_err("%s: Invalid port no#%d", __func__, portno);
@@ -722,7 +725,7 @@ int gsmd_connect(struct gserial *gser, u8 portno)
 
 	ret = usb_ep_enable(gser->in);
 	if (ret) {
-		pr_err("%s: usb_ep_enable failed eptype:IN ep:%p, err:%d",
+		pr_err("%s: usb_ep_enable failed eptype:IN ep:%pK, err:%d",
 				__func__, gser->in, ret);
 		port->port_usb = 0;
 		return ret;
@@ -731,7 +734,7 @@ int gsmd_connect(struct gserial *gser, u8 portno)
 
 	ret = usb_ep_enable(gser->out);
 	if (ret) {
-		pr_err("%s: usb_ep_enable failed eptype:OUT ep:%p, err: %d",
+		pr_err("%s: usb_ep_enable failed eptype:OUT ep:%pK, err: %d",
 				__func__, gser->out, ret);
 		port->port_usb = 0;
 		gser->in->driver_data = 0;
@@ -749,7 +752,7 @@ void gsmd_disconnect(struct gserial *gser, u8 portno)
 	unsigned long flags;
 	struct gsmd_port *port;
 
-	pr_debug("%s: gserial:%p portno:%u\n", __func__, gser, portno);
+	pr_debug("%s: gserial:%pK portno:%u\n", __func__, gser, portno);
 
 	if (portno >= n_smd_ports) {
 		pr_err("%s: invalid portno#%d\n", __func__, portno);
@@ -768,7 +771,7 @@ void gsmd_disconnect(struct gserial *gser, u8 portno)
 	port->is_suspended = false;
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
-	
+	/* disable endpoints, aborting down any active I/O */
 	usb_ep_disable(gser->out);
 	gser->out->driver_data = NULL;
 	usb_ep_disable(gser->in);
@@ -782,7 +785,7 @@ void gsmd_disconnect(struct gserial *gser, u8 portno)
 	spin_unlock_irqrestore(&port->port_lock, flags);
 
 	if (test_and_clear_bit(CH_OPENED, &port->pi->flags)) {
-		
+		/* lower the dtr */
 		port->cbits_to_modem = 0;
 		smd_tiocmset(port->pi->ch,
 				port->cbits_to_modem,
@@ -887,7 +890,7 @@ static int gsmd_port_alloc(int portno, struct usb_cdc_line_coding *coding)
 	pdrv->driver.owner = THIS_MODULE;
 	platform_driver_register(pdrv);
 
-	pr_debug("%s: port:%p portno:%d\n", __func__, port, portno);
+	pr_debug("%s: port:%pK portno:%d\n", __func__, port, portno);
 
 	return 0;
 }
@@ -991,10 +994,10 @@ int gsmd_setup(struct usb_gadget *g, unsigned count)
 	int ret;
 	int i;
 
-	pr_debug("%s: g:%p count: %d\n", __func__, g, count);
+	pr_debug("%s: g:%pK count: %d\n", __func__, g, count);
 
 	if (!count || count > SMD_N_PORTS) {
-		pr_err("%s: Invalid num of ports count:%d gadget:%p\n",
+		pr_err("%s: Invalid num of ports count:%d gadget:%pK\n",
 				__func__, count, g);
 		return -EINVAL;
 	}
@@ -1039,7 +1042,7 @@ void gsmd_suspend(struct gserial *gser, u8 portno)
 {
 	struct gsmd_port *port;
 
-	pr_debug("%s: gserial:%p portno:%u\n", __func__, gser, portno);
+	pr_debug("%s: gserial:%pK portno:%u\n", __func__, gser, portno);
 
 	port = smd_ports[portno].port;
 	spin_lock(&port->port_lock);
@@ -1051,7 +1054,7 @@ void gsmd_resume(struct gserial *gser, u8 portno)
 {
 	struct gsmd_port *port;
 
-	pr_debug("%s: gserial:%p portno:%u\n", __func__, gser, portno);
+	pr_debug("%s: gserial:%pK portno:%u\n", __func__, gser, portno);
 
 	port = smd_ports[portno].port;
 	spin_lock(&port->port_lock);
@@ -1062,7 +1065,7 @@ void gsmd_resume(struct gserial *gser, u8 portno)
 
 void gsmd_cleanup(struct usb_gadget *g, unsigned count)
 {
-	
+	/* TBD */
 }
 
 int gsmd_write(u8 portno, char *buf, unsigned int size)

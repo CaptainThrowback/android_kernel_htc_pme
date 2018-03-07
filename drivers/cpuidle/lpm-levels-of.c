@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -462,7 +462,7 @@ static int parse_cluster_params(struct device_node *node,
 			return ret;
 		}
 
-		
+		/* Set ndevice to 1 as default */
 		c->ndevices = 1;
 
 		return 0;
@@ -687,6 +687,11 @@ static int get_cpumask_for_node(struct device_node *node, struct cpumask *mask)
 	if (!cpu_node) {
 		pr_info("%s: No CPU phandle, assuming single cluster\n",
 				node->full_name);
+		/*
+		 * Not all targets have the cpu node populated in the device
+		 * tree. If cpu node is not populated assume all possible
+		 * nodes belong to this cluster
+		 */
 		cpumask_copy(mask, cpu_possible_mask);
 		return 0;
 	}
@@ -715,7 +720,7 @@ static int calculate_residency(struct power_params *base_pwr,
 	residency /= (int32_t)(base_pwr->ss_power  - next_pwr->ss_power);
 
 	if (residency < 0) {
-		__WARN_printf("%s: Incorrect power attributes for LPM\n",
+		pr_err("%s: residency < 0 for LPM\n",
 				__func__);
 		return next_pwr->time_overhead_us;
 	}
@@ -844,6 +849,12 @@ void free_cluster_node(struct lpm_cluster *cluster)
 	cluster->ndevices = 0;
 }
 
+/*
+ * TODO:
+ * Expects a CPU or a cluster only. This ensures that affinity
+ * level of a cluster is consistent with reference to its
+ * child nodes.
+ */
 struct lpm_cluster *parse_cluster(struct device_node *node,
 		struct lpm_cluster *parent)
 {
@@ -873,7 +884,6 @@ struct lpm_cluster *parse_cluster(struct device_node *node,
 			continue;
 		key = "qcom,pm-cluster-level";
 		if (!of_node_cmp(n->name, key)) {
-			WARN_ON(!use_psci && c->no_saw_devices);
 			if (parse_cluster_level(n, c))
 				goto failed_parse_cluster;
 			continue;
@@ -883,7 +893,10 @@ struct lpm_cluster *parse_cluster(struct device_node *node,
 		if (!of_node_cmp(n->name, key)) {
 			struct lpm_cluster *child;
 
-			WARN_ON(!use_psci && c->no_saw_devices);
+			if (c->no_saw_devices)
+				pr_info("%s: SAW device not provided.\n",
+					__func__);
+
 			child = parse_cluster(n, c);
 			if (!child)
 				goto failed_parse_cluster;
@@ -897,6 +910,11 @@ struct lpm_cluster *parse_cluster(struct device_node *node,
 
 		key = "qcom,pm-cpu";
 		if (!of_node_cmp(n->name, key)) {
+			/*
+			 * Parse the the cpu node only if a pm-cpu node
+			 * is available, though the mask is defined @ the
+			 * cluster level
+			 */
 			if (get_cpumask_for_node(node, &c->child_cpus))
 				goto failed_parse_cluster;
 

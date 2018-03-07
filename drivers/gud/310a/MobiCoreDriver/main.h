@@ -15,8 +15,9 @@
 #ifndef _MC_MAIN_H_
 #define _MC_MAIN_H_
 
-#include <linux/slab.h>		
-#include <linux/fs.h>		
+#include <linux/slab.h>		/* gfp_t */
+#include <linux/fs.h>		/* struct inode and struct file */
+#include <linux/mutex.h>
 
 #define MC_VERSION(major, minor) \
 		(((major & 0x0000ffff) << 16) | (minor & 0x0000ffff))
@@ -32,32 +33,33 @@
 #ifdef DEBUG
 #define mc_dev_devel(fmt, ...) \
 	dev_info(g_ctx.mcd, "%s: " fmt, __func__, ##__VA_ARGS__)
-#else 
+#else /* DEBUG */
 #define mc_dev_devel(...)		do {} while (0)
-#endif 
+#endif /* !DEBUG */
 
+/* MobiCore Driver Kernel Module context data. */
 struct mc_device_ctx {
 	struct device		*mcd;
-	
+	/* debugfs root */
 	struct dentry		*debug_dir;
 
-	
-	
+	/* Features */
+	/* - SWd uses LPAE MMU table format */
 	bool			f_lpae;
-	
+	/* - SWd can set a time out to get scheduled at a future time */
 	bool			f_timeout;
-	
+	/* - SWd supports memory extension which allows for bigger TAs */
 	bool			f_mem_ext;
-	
+	/* - SWd supports TA authorisation */
 	bool			f_ta_auth;
-	
+	/* - SWd can map several buffers at once */
 	bool			f_multimap;
-	
+	/* - SWd supports GP client authentication */
 	bool			f_client_login;
-	
+	/* - SWd needs time updates */
 	bool			f_time;
 
-	
+	/* Debug counters */
 	atomic_t		c_clients;
 	atomic_t		c_cbufs;
 	atomic_t		c_sessions;
@@ -68,7 +70,9 @@ struct mc_device_ctx {
 
 extern struct mc_device_ctx g_ctx;
 
+/* Debug stuff */
 struct kasnprintf_buf {
+	struct mutex mutex;	/* Protect buf/size/off access */
 	gfp_t gfp;
 	void *buf;
 	int size;
@@ -80,6 +84,7 @@ int kasnprintf(struct kasnprintf_buf *buf, const char *fmt, ...);
 ssize_t debug_generic_read(struct file *file, char __user *user_buf,
 			   size_t count, loff_t *ppos,
 			   int (*function)(struct kasnprintf_buf *buf));
+int debug_generic_open(struct inode *inode, struct file *file);
 int debug_generic_release(struct inode *inode, struct file *file);
 
 static inline int kref_read(struct kref *kref)
@@ -87,4 +92,4 @@ static inline int kref_read(struct kref *kref)
 	return atomic_read(&kref->refcount);
 }
 
-#endif 
+#endif /* _MC_MAIN_H_ */

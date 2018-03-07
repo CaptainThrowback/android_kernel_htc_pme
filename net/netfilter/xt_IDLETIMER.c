@@ -257,6 +257,8 @@ static int idletimer_resume(struct notifier_block *notifier,
 			spin_unlock_bh(&timestamp_lock);
 			break;
 		}
+		/* since jiffies are not updated when suspended now represents
+		 * the time it would have suspended */
 		if (time_after(timer->timer.expires, now)) {
 			get_monotonic_boottime(&ts);
 			ts = timespec_sub(ts, timer->last_suspend_time);
@@ -304,6 +306,8 @@ static int idletimer_tg_create(struct idletimer_tg_info *info)
 		pr_debug("couldn't add file to sysfs");
 		goto out_free_attr;
 	}
+	/* notify userspace */
+	kobject_uevent(idletimer_tg_kobj, KOBJ_ADD);
 
 	list_add(&info->timer->entry, &idletimer_tg_list);
 
@@ -351,18 +355,18 @@ static void reset_timer(const struct idletimer_tg_info *info,
 	spin_lock_bh(&timestamp_lock);
 	timer_prev = timer->active;
 	timer->active = true;
-	
+	/* timer_prev is used to guard overflow problem in time_before*/
 	if (!timer_prev || time_before(timer->timer.expires, now)) {
 		pr_debug("Starting Checkentry timer (Expired, Jiffies): %lu, %lu\n",
 				timer->timer.expires, now);
 
-		
+		/* Stores the uid resposible for waking up the radio */
 		if (skb && (skb->sk)) {
 			timer->uid = from_kuid_munged(current_user_ns(),
 						sock_i_uid(skb->sk));
 		}
 
-		
+		/* checks if there is a pending inactive notification*/
 		if (timer->work_pending)
 			timer->delayed_timer_trigger = timer->last_modified_timer;
 		else {
@@ -377,6 +381,9 @@ static void reset_timer(const struct idletimer_tg_info *info,
 	spin_unlock_bh(&timestamp_lock);
 }
 
+/*
+ * The actual xt_tables plugin.
+ */
 static unsigned int idletimer_tg_target(struct sk_buff *skb,
 					 const struct xt_action_param *par)
 {
@@ -396,7 +403,7 @@ static unsigned int idletimer_tg_target(struct sk_buff *skb,
 			 info->label, info->timer->timer.expires, now);
 	}
 
-	
+	/* TODO: Avoid modifying timers on each packet */
 	reset_timer(info, skb);
 	return XT_CONTINUE;
 }
@@ -455,9 +462,9 @@ static void idletimer_tg_destroy(const struct xt_tgdtor_param *par)
 
 		list_del(&info->timer->entry);
 		del_timer_sync(&info->timer->timer);
-		cancel_work_sync(&info->timer->work);
 		sysfs_remove_file(idletimer_tg_kobj, &info->timer->attr.attr);
 		unregister_pm_notifier(&info->timer->pm_nb);
+		cancel_work_sync(&info->timer->work);
 		kfree(info->timer->attr.attr.name);
 		kfree(info->timer);
 	} else {

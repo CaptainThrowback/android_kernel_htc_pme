@@ -26,6 +26,8 @@
 
 #include <linux/mmc/host.h>
 #include <linux/mmc/card.h>
+#include <linux/mmc/ring_buffer.h>
+
 #include <linux/mmc/slot-gpio.h>
 
 #include "core.h"
@@ -86,6 +88,13 @@ static ssize_t clkgate_delay_store(struct device *dev,
 	return count;
 }
 
+/*
+ * Enabling clock gating will make the core call out to the host
+ * once up and once down when it performs a request or card operation
+ * intermingled in any fashion. The driver will see this through
+ * set_ios() operations with ios.clock field set to 0 to gate (disable)
+ * the block clock, and to the old frequency to enable it again.
+ */
 static void mmc_host_clk_gate_delayed(struct mmc_host *host)
 {
 	unsigned long tick_ns;
@@ -98,14 +107,24 @@ static void mmc_host_clk_gate_delayed(struct mmc_host *host)
 			 mmc_hostname(host));
 		return;
 	}
+	/*
+	 * New requests may have appeared while we were scheduling,
+	 * then there is no reason to delay the check before
+	 * clk_disable().
+	 */
 	spin_lock_irqsave(&host->clk_lock, flags);
 
+	/*
+	 * Delay n bus cycles (at least 8 from MMC spec) before attempting
+	 * to disable the MCI block clock. The reference count may have
+	 * gone up again after this delay due to rescheduling!
+	 */
 	if (!host->clk_requests) {
 		spin_unlock_irqrestore(&host->clk_lock, flags);
 		tick_ns = DIV_ROUND_UP(1000000000, freq);
 		ndelay(host->clk_delay * tick_ns);
 	} else {
-		
+		/* New users appeared while waiting for this work */
 		spin_unlock_irqrestore(&host->clk_lock, flags);
 		return;
 	}
@@ -113,7 +132,7 @@ static void mmc_host_clk_gate_delayed(struct mmc_host *host)
 	spin_lock_irqsave(&host->clk_lock, flags);
 	if (!host->clk_requests) {
 		spin_unlock_irqrestore(&host->clk_lock, flags);
-		
+		/* This will set host->ios.clock to 0 */
 		mmc_gate_clock(host);
 		spin_lock_irqsave(&host->clk_lock, flags);
 		pr_debug("%s: gated MCI clock\n", mmc_hostname(host));
@@ -122,6 +141,9 @@ static void mmc_host_clk_gate_delayed(struct mmc_host *host)
 	mutex_unlock(&host->clk_gate_mutex);
 }
 
+/*
+ * Internal work. Work to disable the clock at some later point.
+ */
 static void mmc_host_clk_gate_work(struct work_struct *work)
 {
 	struct mmc_host *host = container_of(work, struct mmc_host,
@@ -130,11 +152,19 @@ static void mmc_host_clk_gate_work(struct work_struct *work)
 	mmc_host_clk_gate_delayed(host);
 }
 
+/**
+ *	mmc_host_clk_hold - ungate hardware MCI clocks
+ *	@host: host to ungate.
+ *
+ *	Makes sure the host ios.clock is restored to a non-zero value
+ *	past this call.	Increase clock reference count and ungate clock
+ *	if we're the first user.
+ */
 void mmc_host_clk_hold(struct mmc_host *host)
 {
 	unsigned long flags;
 
-	
+	/* cancel any clock gating work scheduled by mmc_host_clk_release() */
 	cancel_delayed_work_sync(&host->clk_gate_work);
 	mutex_lock(&host->clk_gate_mutex);
 	spin_lock_irqsave(&host->clk_lock, flags);
@@ -150,18 +180,42 @@ void mmc_host_clk_hold(struct mmc_host *host)
 	mutex_unlock(&host->clk_gate_mutex);
 }
 
+/**
+ *	mmc_host_may_gate_card - check if this card may be gated
+ *	@card: card to check.
+ */
 bool mmc_host_may_gate_card(struct mmc_card *card)
 {
-	
+	/* If there is no card we may gate it */
 	if (!card)
 		return true;
 
+	/*
+	 * SDIO3.0 card allows the clock to be gated off so check if
+	 * that is the case or not.
+	 */
 	if (mmc_card_sdio(card) && card->cccr.async_intr_sup)
 			return true;
 
+	/*
+	 * Don't gate SDIO cards! These need to be clocked at all times
+	 * since they may be independent systems generating interrupts
+	 * and other events. The clock requests counter from the core will
+	 * go down to zero since the core does not need it, but we will not
+	 * gate the clock, because there is somebody out there that may still
+	 * be using it.
+	 */
 	return !(card->quirks & MMC_QUIRK_BROKEN_CLK_GATING);
 }
 
+/**
+ *	mmc_host_clk_release - gate off hardware MCI clocks
+ *	@host: host to gate.
+ *
+ *	Calls the host driver with ios.clock set to zero as often as possible
+ *	in order to gate off hardware MCI clocks. Decrease clock reference
+ *	count and schedule disabling of clock.
+ */
 void mmc_host_clk_release(struct mmc_host *host)
 {
 	unsigned long flags;
@@ -175,6 +229,12 @@ void mmc_host_clk_release(struct mmc_host *host)
 	spin_unlock_irqrestore(&host->clk_lock, flags);
 }
 
+/**
+ *	mmc_host_clk_rate - get current clock frequency setting
+ *	@host: host to get the clock frequency for.
+ *
+ *	Returns current clock frequency regardless of gating.
+ */
 unsigned int mmc_host_clk_rate(struct mmc_host *host)
 {
 	unsigned long freq;
@@ -189,11 +249,19 @@ unsigned int mmc_host_clk_rate(struct mmc_host *host)
 	return freq;
 }
 
+/**
+ *	mmc_host_clk_init - set up clock gating code
+ *	@host: host with potential clock to control
+ */
 static inline void mmc_host_clk_init(struct mmc_host *host)
 {
 	host->clk_requests = 0;
-	
+	/* Hold MCI clock for 8 cycles by default */
 	host->clk_delay = 8;
+	/*
+	 * Default clock gating delay is 0ms to avoid wasting power.
+	 * This value can be tuned by writing into sysfs entry.
+	 */
 	host->clkgate_delay = 0;
 	host->clk_gated = false;
 	INIT_DELAYED_WORK(&host->clk_gate_work, mmc_host_clk_gate_work);
@@ -201,13 +269,21 @@ static inline void mmc_host_clk_init(struct mmc_host *host)
 	mutex_init(&host->clk_gate_mutex);
 }
 
+/**
+ *	mmc_host_clk_exit - shut down clock gating code
+ *	@host: host with potential clock to control
+ */
 static inline void mmc_host_clk_exit(struct mmc_host *host)
 {
+	/*
+	 * Wait for any outstanding gate and then make sure we're
+	 * ungated before exiting.
+	 */
 	if (cancel_delayed_work_sync(&host->clk_gate_work))
 		mmc_host_clk_gate_delayed(host);
 	if (host->clk_gated)
 		mmc_host_clk_hold(host);
-	
+	/* There should be only one user now */
 	WARN_ON(host->clk_requests > 1);
 }
 
@@ -238,6 +314,83 @@ static inline void mmc_host_clk_sysfs_init(struct mmc_host *host)
 
 #endif
 
+void mmc_retune_enable(struct mmc_host *host)
+{
+	host->can_retune = 1;
+		if (host->retune_period)
+			mod_timer(&host->retune_timer,
+               jiffies + host->retune_period * HZ);
+}
+
+void mmc_retune_disable(struct mmc_host *host)
+{
+	host->can_retune = 0;
+	del_timer_sync(&host->retune_timer);
+	host->retune_now = 0;
+	host->need_retune = 0;
+}
+
+void mmc_retune_timer_stop(struct mmc_host *host)
+{
+	del_timer_sync(&host->retune_timer);
+}
+EXPORT_SYMBOL(mmc_retune_timer_stop);
+
+void mmc_retune_hold(struct mmc_host *host)
+{
+	if (!host->hold_retune)
+		host->retune_now = 1;
+	host->hold_retune += 1;
+}
+
+void mmc_retune_release(struct mmc_host *host)
+{
+	if (host->hold_retune)
+		host->hold_retune -= 1;
+	else
+		WARN_ON(1);
+}
+
+int mmc_retune(struct mmc_host *host)
+{
+	int err;
+
+	if (host->retune_now)
+		host->retune_now = 0;
+	else
+		return 0;
+
+	if (!host->need_retune || host->doing_retune || !host->card)
+		return 0;
+
+  host->need_retune = 0;
+
+	host->doing_retune = 1;
+
+	err = mmc_execute_tuning(host->card);
+
+	host->doing_retune = 0;
+
+	return err;
+}
+
+static void mmc_retune_timer(unsigned long data)
+{
+	struct mmc_host *host = (struct mmc_host *)data;
+
+	mmc_retune_needed(host);
+}
+
+
+/**
+ *	mmc_of_parse() - parse host's device-tree node
+ *	@host: host whose node should be parsed.
+ *
+ * To keep the rest of the MMC subsystem unaware of whether DT has been
+ * used to to instantiate and configure this host instance or not, we
+ * parse the properties and set respective generic mmc-host flags and
+ * parameters.
+ */
 int mmc_of_parse(struct mmc_host *host)
 {
 	struct device_node *np;
@@ -251,7 +404,7 @@ int mmc_of_parse(struct mmc_host *host)
 
 	np = host->parent->of_node;
 
-	
+	/* "bus-width" is translated to MMC_CAP_*_BIT_DATA flags */
 	if (of_property_read_u32(np, "bus-width", &bus_width) < 0) {
 		dev_dbg(host->parent,
 			"\"bus-width\" property is missing, assuming 1 bit.\n");
@@ -261,7 +414,7 @@ int mmc_of_parse(struct mmc_host *host)
 	switch (bus_width) {
 	case 8:
 		host->caps |= MMC_CAP_8_BIT_DATA;
-		
+		/* Hosts capable of 8-bit transfers can also do 4 bits */
 	case 4:
 		host->caps |= MMC_CAP_4_BIT_DATA;
 		break;
@@ -273,11 +426,22 @@ int mmc_of_parse(struct mmc_host *host)
 		return -EINVAL;
 	}
 
-	
+	/* f_max is obtained from the optional "max-frequency" property */
 	of_property_read_u32(np, "max-frequency", &host->f_max);
 
+	/*
+	 * Configure CD and WP pins. They are both by default active low to
+	 * match the SDHCI spec. If GPIOs are provided for CD and / or WP, the
+	 * mmc-gpio helpers are used to attach, configure and use them. If
+	 * polarity inversion is specified in DT, one of MMC_CAP2_CD_ACTIVE_HIGH
+	 * and MMC_CAP2_RO_ACTIVE_HIGH capability-2 flags is set. If the
+	 * "broken-cd" property is provided, the MMC_CAP_NEEDS_POLL capability
+	 * is set. If the "non-removable" property is found, the
+	 * MMC_CAP_NONREMOVABLE capability is set and no card-detection
+	 * configuration is performed.
+	 */
 
-	
+	/* Parse Card Detection */
 	if (of_find_property(np, "non-removable", &len)) {
 		host->caps |= MMC_CAP_NONREMOVABLE;
 	} else {
@@ -299,11 +463,22 @@ int mmc_of_parse(struct mmc_host *host)
 		} else
 			dev_info(host->parent, "Got CD GPIO\n");
 
+		/*
+		 * There are two ways to flag that the CD line is inverted:
+		 * through the cd-inverted flag and by the GPIO line itself
+		 * being inverted from the GPIO subsystem. This is a leftover
+		 * from the times when the GPIO subsystem did not make it
+		 * possible to flag a line as inverted.
+		 *
+		 * If the capability on the host AND the GPIO line are
+		 * both inverted, the end result is that the CD line is
+		 * not inverted.
+		 */
 		if (cd_cap_invert ^ cd_gpio_invert)
 			host->caps2 |= MMC_CAP2_CD_ACTIVE_HIGH;
 	}
 
-	
+	/* Parse Write Protection */
 	ro_cap_invert = of_property_read_bool(np, "wp-inverted");
 
 	ret = mmc_gpiod_request_ro(host, "wp", 0, false, 0, &ro_gpio_invert);
@@ -318,7 +493,7 @@ int mmc_of_parse(struct mmc_host *host)
 	} else
 		dev_info(host->parent, "Got WP GPIO\n");
 
-	
+	/* See the comment on CD inversion above */
 	if (ro_cap_invert ^ ro_gpio_invert)
 		host->caps2 |= MMC_CAP2_RO_ACTIVE_HIGH;
 
@@ -376,6 +551,13 @@ out:
 
 EXPORT_SYMBOL(mmc_of_parse);
 
+/**
+ *	mmc_alloc_host - initialise the per-host structure.
+ *	@extra: sizeof private data structure
+ *	@dev: pointer to host device model structure
+ *
+ *	Initialise the per-host structure.
+ */
 struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 {
 	int err;
@@ -385,7 +567,7 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 	if (!host)
 		return NULL;
 
-	
+	/* scanning will be enabled when we're ready */
 	host->rescan_disable = 1;
 	idr_preload(GFP_KERNEL);
 	spin_lock(&mmc_host_lock);
@@ -419,7 +601,12 @@ struct mmc_host *mmc_alloc_host(int extra, struct device *dev)
 #ifdef CONFIG_PM
 	host->pm_notify.notifier_call = mmc_pm_notify;
 #endif
+  setup_timer(&host->retune_timer, mmc_retune_timer, (unsigned long)host);
 
+	/*
+	 * By default, hosts do not support SGIO or large requests.
+	 * They have to set these according to their abilities.
+	 */
 	host->max_segs = 1;
 	host->max_seg_size = PAGE_CACHE_SIZE;
 
@@ -459,15 +646,15 @@ static ssize_t store_enable(struct device *dev,
 	mmc_get_card(host->card);
 
 	if (!value) {
-		
+		/*turning off clock scaling*/
 		mmc_exit_clk_scaling(host);
 		host->caps2 &= ~MMC_CAP2_CLK_SCALE;
 		host->clk_scaling.state = MMC_LOAD_HIGH;
-		
+		/* Set to max. frequency when disabling */
 		mmc_clk_update_freq(host, host->card->clk_scaling_highest,
 					host->clk_scaling.state);
 	} else if (value) {
-		
+		/* starting clock scaling, will restart in case started */
 		host->caps2 |= MMC_CAP2_CLK_SCALE;
 		if (host->clk_scaling.enable)
 			mmc_exit_clk_scaling(host);
@@ -645,6 +832,14 @@ static struct attribute_group dev_attr_grp = {
 	.attrs = dev_attrs,
 };
 
+/**
+ *	mmc_add_host - initialise host hardware
+ *	@host: mmc host
+ *
+ *	Register the host with the driver model. The host must be
+ *	prepared to start servicing requests before this function
+ *	completes.
+ */
 int mmc_add_host(struct mmc_host *host)
 {
 	int err;
@@ -667,6 +862,7 @@ int mmc_add_host(struct mmc_host *host)
 	mmc_add_host_debugfs(host);
 #endif
 	mmc_host_clk_sysfs_init(host);
+	mmc_trace_init(host);
 
 	err = sysfs_create_group(&host->class_dev.kobj, &clk_scaling_attr_grp);
 	if (err)
@@ -687,6 +883,14 @@ int mmc_add_host(struct mmc_host *host)
 
 EXPORT_SYMBOL(mmc_add_host);
 
+/**
+ *	mmc_remove_host - remove host hardware
+ *	@host: mmc host
+ *
+ *	Unregister and remove all cards associated with this host,
+ *	and power down the MMC bus. No new requests will be issued
+ *	after this function has returned.
+ */
 void mmc_remove_host(struct mmc_host *host)
 {
 	if (!(host->pm_flags & MMC_PM_IGNORE_PM_NOTIFY))
@@ -709,6 +913,12 @@ void mmc_remove_host(struct mmc_host *host)
 
 EXPORT_SYMBOL(mmc_remove_host);
 
+/**
+ *	mmc_free_host - free the host structure
+ *	@host: mmc host
+ *
+ *	Free the host once all references to it have been dropped.
+ */
 void mmc_free_host(struct mmc_host *host)
 {
 	spin_lock(&mmc_host_lock);

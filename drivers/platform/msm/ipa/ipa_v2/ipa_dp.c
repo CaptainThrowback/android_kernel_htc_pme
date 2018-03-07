@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,7 @@
 #define POLLING_INACTIVITY_TX 40
 #define POLLING_MIN_SLEEP_TX 400
 #define POLLING_MAX_SLEEP_TX 500
+/* 8K less 1 nominal MTU (1500 bytes) rounded to units of KB */
 #define IPA_MTU 1500
 #define IPA_GENERIC_AGGR_BYTE_LIMIT 6
 #define IPA_GENERIC_AGGR_TIME_LIMIT 1
@@ -41,6 +42,7 @@
 
 #define IPA_RX_BUFF_CLIENT_HEADROOM 256
 
+/* less 1 nominal MTU (1500 bytes) rounded to units of KB */
 #define IPA_ADJUST_AGGR_BYTE_LIMIT(X) (((X) - IPA_MTU)/1000)
 
 #define IPA_WLAN_RX_POOL_SZ 100
@@ -156,6 +158,19 @@ static void ipa_wq_write_done_status(int src_pipe)
 	ipa_wq_write_done_common(sys, cnt);
 }
 
+/**
+ * ipa_write_done() - this function will be (eventually) called when a Tx
+ * operation is complete
+ * * @work:	work_struct used by the work queue
+ *
+ * Will be called in deferred context.
+ * - invoke the callback supplied by the client who sent this command
+ * - iterate over all packets and validate that
+ *   the order for sent packet is the same as expected
+ * - delete all the tx packet descriptors from the system
+ *   pipe context (not needed anymore)
+ * - return the tx buffer back to dma_pool
+ */
 static void ipa_wq_write_done(struct work_struct *work)
 {
 	struct ipa_tx_pkt_wrapper *tx_pkt;
@@ -196,6 +211,9 @@ static int ipa_handle_tx_core(struct ipa_sys_context *sys, bool process_all,
 	return cnt;
 }
 
+/**
+ * ipa_tx_switch_to_intr_mode() - Operate the Tx data path in interrupt mode
+ */
 static void ipa_tx_switch_to_intr_mode(struct ipa_sys_context *sys)
 {
 	int ret;
@@ -262,6 +280,19 @@ static void ipa_wq_handle_tx(struct work_struct *work)
 	ipa_handle_tx(sys);
 }
 
+/**
+ * ipa_send_one() - Send a single descriptor
+ * @sys:	system pipe context
+ * @desc:	descriptor to send
+ * @in_atomic:  whether caller is in atomic context
+ *
+ * - Allocate tx_packet wrapper
+ * - transfer data to the IPA
+ * - after the transfer was done the SPS will
+ *   notify the sending user via ipa_sps_irq_comp_tx()
+ *
+ * Return codes: 0: success, -EFAULT: failure
+ */
 int ipa_send_one(struct ipa_sys_context *sys, struct ipa_desc *desc,
 		bool in_atomic)
 {
@@ -290,14 +321,14 @@ int ipa_send_one(struct ipa_sys_context *sys, struct ipa_desc *desc,
 		dma_address = desc->dma_address;
 		tx_pkt->no_unmap_dma = true;
 	}
-	if (!dma_address) {
-		IPAERR("failed to DMA wrap\n");
+	if (dma_mapping_error(ipa_ctx->pdev, dma_address)) {
+		IPAERR("dma_map_single failed\n");
 		goto fail_dma_map;
 	}
 
 	INIT_LIST_HEAD(&tx_pkt->link);
 	tx_pkt->type = desc->type;
-	tx_pkt->cnt = 1;    
+	tx_pkt->cnt = 1;    /* only 1 desc in this "set" */
 
 	tx_pkt->mem.phys_base = dma_address;
 	tx_pkt->mem.base = desc->pyld;
@@ -307,10 +338,14 @@ int ipa_send_one(struct ipa_sys_context *sys, struct ipa_desc *desc,
 	tx_pkt->user1 = desc->user1;
 	tx_pkt->user2 = desc->user2;
 
+	/*
+	 * Special treatment for immediate commands, where the structure of the
+	 * descriptor is different
+	 */
 	if (desc->type == IPA_IMM_CMD_DESC) {
 		sps_flags |= SPS_IOVEC_FLAG_IMME;
 		len = desc->opcode;
-		IPADBG("sending cmd=%d pyld_len=%d sps_flags=%x\n",
+		IPADBG_LOW("sending cmd=%d pyld_len=%d sps_flags=%x\n",
 				desc->opcode, desc->len, sps_flags);
 		IPA_DUMP_BUFF(desc->pyld, dma_address, desc->len);
 	} else {
@@ -353,6 +388,26 @@ fail_mem_alloc:
 	return -EFAULT;
 }
 
+/**
+ * ipa_send() - Send multiple descriptors in one HW transaction
+ * @sys: system pipe context
+ * @num_desc: number of packets
+ * @desc: packets to send (may be immediate command or data)
+ * @in_atomic:  whether caller is in atomic context
+ *
+ * This function is used for system-to-bam connection.
+ * - SPS driver expect struct sps_transfer which will contain all the data
+ *   for a transaction
+ * - ipa_tx_pkt_wrapper will be used for each ipa
+ *   descriptor (allocated from wrappers cache)
+ * - The wrapper struct will be configured for each ipa-desc payload and will
+ *   contain information which will be later used by the user callbacks
+ * - each transfer will be made by calling to sps_transfer()
+ * - Each packet (command or data) that will be sent will also be saved in
+ *   ipa_sys_context for later check that all data was sent
+ *
+ * Return codes: 0: success, -EFAULT: failure
+ */
 int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 		bool in_atomic)
 {
@@ -364,14 +419,16 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 	int i = 0;
 	int j;
 	int result;
-	int fail_dma_wrap = 0;
 	uint size = num_desc * sizeof(struct sps_iovec);
-	u32 mem_flag = GFP_ATOMIC;
+	gfp_t mem_flag = GFP_ATOMIC;
 	struct sps_iovec iov;
 	int ret;
+	gfp_t flag;
 
 	if (unlikely(!in_atomic))
 		mem_flag = GFP_KERNEL;
+
+	flag = mem_flag | (ipa_ctx->use_dma_zone ? GFP_DMA : 0);
 
 	if (num_desc == IPA_NUM_DESC_PER_SW_TX) {
 		transfer.iovec = dma_pool_alloc(ipa_ctx->dma_pool, mem_flag,
@@ -381,7 +438,7 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 			return -EFAULT;
 		}
 	} else {
-		transfer.iovec = kmalloc(size, mem_flag);
+		transfer.iovec = kmalloc(size, flag);
 		if (!transfer.iovec) {
 			IPAERR("fail to alloc mem for sps xfr buff ");
 			IPAERR("num_desc = %d size = %d\n", num_desc, size);
@@ -389,7 +446,7 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 		}
 		dma_addr  = dma_map_single(ipa_ctx->pdev,
 				transfer.iovec, size, DMA_TO_DEVICE);
-		if (!dma_addr) {
+		if (dma_mapping_error(ipa_ctx->pdev, dma_addr)) {
 			IPAERR("dma_map_single failed for sps xfr buff\n");
 			kfree(transfer.iovec);
 			return -EFAULT;
@@ -401,13 +458,16 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 	spin_lock_bh(&sys->spinlock);
 
 	for (i = 0; i < num_desc; i++) {
-		fail_dma_wrap = 0;
 		tx_pkt = kmem_cache_zalloc(ipa_ctx->tx_pkt_wrapper_cache,
 					   mem_flag);
 		if (!tx_pkt) {
 			IPAERR("failed to alloc tx wrapper\n");
 			goto failure;
 		}
+		/*
+		 * first desc of set is "special" as it holds the count and
+		 * other info
+		 */
 		if (i == 0) {
 			transfer.user = tx_pkt;
 			tx_pkt->mult.phys_base = dma_addr;
@@ -453,10 +513,9 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 			}
 		}
 
-		if (!tx_pkt->mem.phys_base) {
-			IPAERR("failed to alloc tx wrapper\n");
-			fail_dma_wrap = 1;
-			goto failure;
+		if (dma_mapping_error(ipa_ctx->pdev, tx_pkt->mem.phys_base)) {
+			IPAERR("dma_map_single failed\n");
+			goto failure_dma_map;
 		}
 
 		tx_pkt->sys = sys;
@@ -464,9 +523,17 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 		tx_pkt->user1 = desc[i].user1;
 		tx_pkt->user2 = desc[i].user2;
 
+		/*
+		 * Point the iovec to the buffer and
+		 * add this packet to system pipe context.
+		 */
 		iovec->addr = tx_pkt->mem.phys_base;
 		list_add_tail(&tx_pkt->link, &sys->head_desc_list);
 
+		/*
+		 * Special treatment for immediate commands, where the structure
+		 * of the descriptor is different
+		 */
 		if (desc[i].type == IPA_IMM_CMD_DESC) {
 			iovec->size = desc[i].opcode;
 			iovec->flags |= SPS_IOVEC_FLAG_IMME;
@@ -478,7 +545,7 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 
 		if (i == (num_desc - 1)) {
 			iovec->flags |= SPS_IOVEC_FLAG_EOT;
-			
+			/* "mark" the last desc */
 			tx_pkt->cnt = IPA_LAST_DESC_CNT;
 		}
 	}
@@ -503,27 +570,30 @@ int ipa_send(struct ipa_sys_context *sys, u32 num_desc, struct ipa_desc *desc,
 	spin_unlock_bh(&sys->spinlock);
 	return 0;
 
+failure_dma_map:
+	kmem_cache_free(ipa_ctx->tx_pkt_wrapper_cache, tx_pkt);
+
 failure:
 	tx_pkt = transfer.user;
 	for (j = 0; j < i; j++) {
 		next_pkt = list_next_entry(tx_pkt, link);
 		list_del(&tx_pkt->link);
-		if (desc[j].type != IPA_DATA_DESC_SKB_PAGED) {
-			dma_unmap_single(ipa_ctx->pdev, tx_pkt->mem.phys_base,
-				tx_pkt->mem.size,
-				DMA_TO_DEVICE);
-		} else {
-			dma_unmap_page(ipa_ctx->pdev, tx_pkt->mem.phys_base,
-				tx_pkt->mem.size,
-				DMA_TO_DEVICE);
+		if (!tx_pkt->no_unmap_dma) {
+			if (desc[j].type != IPA_DATA_DESC_SKB_PAGED) {
+				dma_unmap_single(ipa_ctx->pdev,
+					tx_pkt->mem.phys_base,
+					tx_pkt->mem.size,
+					DMA_TO_DEVICE);
+			} else {
+				dma_unmap_page(ipa_ctx->pdev,
+					tx_pkt->mem.phys_base,
+					tx_pkt->mem.size,
+					DMA_TO_DEVICE);
+			}
 		}
 		kmem_cache_free(ipa_ctx->tx_pkt_wrapper_cache, tx_pkt);
 		tx_pkt = next_pkt;
 	}
-	if (j < num_desc)
-		
-		if (fail_dma_wrap)
-			kmem_cache_free(ipa_ctx->tx_pkt_wrapper_cache, tx_pkt);
 	if (transfer.iovec_phys) {
 		if (num_desc == IPA_NUM_DESC_PER_SW_TX) {
 			dma_pool_free(ipa_ctx->dma_pool, transfer.iovec,
@@ -538,6 +608,15 @@ failure:
 	return -EFAULT;
 }
 
+/**
+ * ipa_sps_irq_cmd_ack - callback function which will be called by SPS driver after an
+ * immediate command is complete.
+ * @user1:	pointer to the descriptor of the transfer
+ * @user2:
+ *
+ * Complete the immediate commands completion object, this will release the
+ * thread which waits on this completion object (ipa_send_cmd())
+ */
 static void ipa_sps_irq_cmd_ack(void *user1, int user2)
 {
 	struct ipa_desc *desc = (struct ipa_desc *)user1;
@@ -547,18 +626,29 @@ static void ipa_sps_irq_cmd_ack(void *user1, int user2)
 		WARN_ON(1);
 		return;
 	}
-	IPADBG("got ack for cmd=%d\n", desc->opcode);
+	IPADBG_LOW("got ack for cmd=%d\n", desc->opcode);
 	complete(&desc->xfer_done);
 }
 
+/**
+ * ipa_send_cmd - send immediate commands
+ * @num_desc:	number of descriptors within the desc struct
+ * @descr:	descriptor structure
+ *
+ * Function will block till command gets ACK from IPA HW, caller needs
+ * to free any resources it allocated after function returns
+ * The callback in ipa_desc should not be set by the caller
+ * for this function.
+ */
 int ipa_send_cmd(u16 num_desc, struct ipa_desc *descr)
 {
 	struct ipa_desc *desc;
-	int result = 0;
+	int i, result = 0;
 	struct ipa_sys_context *sys;
 	int ep_idx;
 
-	IPADBG("sending command\n");
+	for (i = 0; i < num_desc; i++)
+		IPADBG_LOW("sending imm cmd %d\n", descr[i].opcode);
 
 	ep_idx = ipa2_get_ep_mapping(IPA_CLIENT_APPS_CMD_PROD);
 	if (-1 == ep_idx) {
@@ -606,12 +696,20 @@ bail:
 	return result;
 }
 
+/**
+ * ipa_sps_irq_tx_notify() - Callback function which will be called by
+ * the SPS driver to start a Tx poll operation.
+ * Called in an interrupt context.
+ * @notify:	SPS driver supplied notification struct
+ *
+ * This function defer the work for this event to the tx workqueue.
+ */
 static void ipa_sps_irq_tx_notify(struct sps_event_notify *notify)
 {
 	struct ipa_sys_context *sys = (struct ipa_sys_context *)notify->user;
 	int ret;
 
-	IPADBG("event %d notified\n", notify->event_id);
+	IPADBG_LOW("event %d notified\n", notify->event_id);
 
 	switch (notify->event_id) {
 	case SPS_EVENT_EOT:
@@ -641,11 +739,20 @@ static void ipa_sps_irq_tx_notify(struct sps_event_notify *notify)
 	}
 }
 
+/**
+ * ipa_sps_irq_tx_no_aggr_notify() - Callback function which will be called by
+ * the SPS driver after a Tx operation is complete.
+ * Called in an interrupt context.
+ * @notify:	SPS driver supplied notification struct
+ *
+ * This function defer the work for this event to the tx workqueue.
+ * This event will be later handled by ipa_write_done.
+ */
 static void ipa_sps_irq_tx_no_aggr_notify(struct sps_event_notify *notify)
 {
 	struct ipa_tx_pkt_wrapper *tx_pkt;
 
-	IPADBG("event %d notified\n", notify->event_id);
+	IPADBG_LOW("event %d notified\n", notify->event_id);
 
 	switch (notify->event_id) {
 	case SPS_EVENT_EOT:
@@ -659,6 +766,20 @@ static void ipa_sps_irq_tx_no_aggr_notify(struct sps_event_notify *notify)
 	}
 }
 
+/**
+ * ipa_handle_rx_core() - The core functionality of packet reception. This
+ * function is read from multiple code paths.
+ *
+ * All the packets on the Rx data path are received on the IPA_A5_LAN_WAN_IN
+ * endpoint. The function runs as long as there are packets in the pipe.
+ * For each packet:
+ *  - Disconnect the packet from the system pipe linked list
+ *  - Unmap the packets skb, make it non DMAable
+ *  - Free the packet from the cache
+ *  - Prepare a proper skb
+ *  - Call the endpoints notify function, passing the skb in the parameters
+ *  - Replenish the rx cache
+ */
 static int ipa_handle_rx_core(struct ipa_sys_context *sys, bool process_all,
 		bool in_poll_state)
 {
@@ -692,6 +813,9 @@ static int ipa_handle_rx_core(struct ipa_sys_context *sys, bool process_all,
 	return cnt;
 }
 
+/**
+ * ipa_rx_switch_to_intr_mode() - Operate the Rx data path in interrupt mode
+ */
 static void ipa_rx_switch_to_intr_mode(struct ipa_sys_context *sys)
 {
 	int ret;
@@ -742,10 +866,18 @@ fail:
 }
 
 
+/**
+ * ipa_sps_irq_control() - Function to enable or disable BAM IRQ.
+ */
 static void ipa_sps_irq_control(struct ipa_sys_context *sys, bool enable)
 {
 	int ret;
 
+	/*
+	 * Do not change sps config in case we are in polling mode as this
+	 * indicates that sps driver already notified EOT event and sps config
+	 * should not change until ipa driver processes the packet.
+	 */
 	if (atomic_read(&sys->curr_polling_state)) {
 		IPADBG("in polling mode, do not change config\n");
 		return;
@@ -814,6 +946,19 @@ void ipa_sps_irq_control_all(bool enable)
 	}
 }
 
+/**
+ * ipa_rx_notify() - Callback function which is called by the SPS driver when a
+ * a packet is received
+ * @notify:	SPS driver supplied notification information
+ *
+ * Called in an interrupt context, therefore the majority of the work is
+ * deffered using a work queue.
+ *
+ * After receiving a packet, the driver goes to polling mode and keeps pulling
+ * packets until the rx buffer is empty, then it goes back to interrupt mode.
+ * This comes to prevent the CPU from handling too many interrupts when the
+ * throughput is high.
+ */
 static void ipa_sps_irq_rx_notify(struct sps_event_notify *notify)
 {
 	struct ipa_sys_context *sys = (struct ipa_sys_context *)notify->user;
@@ -861,6 +1006,14 @@ static void switch_to_intr_tx_work_func(struct work_struct *work)
 	ipa_handle_tx(sys);
 }
 
+/**
+ * ipa_handle_rx() - handle packet reception. This function is executed in the
+ * context of a work queue.
+ * @work: work struct needed by the work queue
+ *
+ * ipa_handle_rx_core() is run in polling mode. After all packets has been
+ * received, the driver switches back to interrupt mode.
+ */
 static void ipa_handle_rx(struct ipa_sys_context *sys)
 {
 	int inactive_cycles = 0;
@@ -879,6 +1032,10 @@ static void ipa_handle_rx(struct ipa_sys_context *sys)
 			inactive_cycles = 0;
 		}
 
+		/* if pipe is out of buffers there is no point polling for
+		 * completed descs; release the worker so delayed work can
+		 * run in a timely manner
+		 */
 		if (sys->len == 0)
 			break;
 
@@ -899,12 +1056,17 @@ static void switch_to_intr_rx_work_func(struct work_struct *work)
 	ipa_handle_rx(sys);
 }
 
+/**
+ * ipa_update_repl_threshold()- Update the repl_threshold for the client.
+ *
+ * Return value: None.
+ */
 void ipa_update_repl_threshold(enum ipa_client_type ipa_client)
 {
 	int ep_idx;
 	struct ipa_ep_context *ep;
 
-	
+	/* Check if ep is valid. */
 	ep_idx = ipa2_get_ep_mapping(ipa_client);
 	if (ep_idx == -1) {
 		IPADBG("Invalid IPA client\n");
@@ -916,10 +1078,33 @@ void ipa_update_repl_threshold(enum ipa_client_type ipa_client)
 		IPADBG("EP not valid/Not applicable for client.\n");
 		return;
 	}
-	ep->rx_replenish_threshold = ipa_get_sys_yellow_wm(ep->sys)
-					/ ep->sys->rx_buff_sz;
+	/*
+	 * Determine how many buffers/descriptors remaining will
+	 * cause to drop below the yellow WM bar.
+	 */
+	if (ep->sys->rx_buff_sz)
+		ep->rx_replenish_threshold = ipa_get_sys_yellow_wm(ep->sys)
+						/ ep->sys->rx_buff_sz;
+	else
+		ep->rx_replenish_threshold = 0;
 }
 
+/**
+ * ipa2_setup_sys_pipe() - Setup an IPA end-point in system-BAM mode and perform
+ * IPA EP configuration
+ * @sys_in:	[in] input needed to setup BAM pipe and configure EP
+ * @clnt_hdl:	[out] client handle
+ *
+ *  - configure the end-point registers with the supplied
+ *    parameters from the user.
+ *  - call SPS APIs to create a system-to-bam connection with IPA.
+ *  - allocate descriptor FIFO
+ *  - register callback function(ipa_sps_irq_rx_notify or
+ *    ipa_sps_irq_tx_notify - depends on client type) in case the driver is
+ *    not configured to pulling mode
+ *
+ * Returns:	0 on success, negative on failure
+ */
 int ipa2_setup_sys_pipe(struct ipa_sys_connect_params *sys_in, u32 *clnt_hdl)
 {
 	struct ipa_ep_context *ep;
@@ -1071,7 +1256,7 @@ int ipa2_setup_sys_pipe(struct ipa_sys_connect_params *sys_in, u32 *clnt_hdl)
 		IPADBG("skipping ep configuration\n");
 	}
 
-	
+	/* Default Config */
 	ep->ep_hdl = sps_alloc_endpoint();
 	if (ep->ep_hdl == NULL) {
 		IPAERR("SPS EP allocation failed.\n");
@@ -1084,15 +1269,26 @@ int ipa2_setup_sys_pipe(struct ipa_sys_connect_params *sys_in, u32 *clnt_hdl)
 		goto fail_sps_cfg;
 	}
 
-	
+	/* Specific Config */
 	if (IPA_CLIENT_IS_CONS(sys_in->client)) {
 		ep->connect.mode = SPS_MODE_SRC;
 		ep->connect.destination = SPS_DEV_HANDLE_MEM;
 		ep->connect.source = ipa_ctx->bam_handle;
 		ep->connect.dest_pipe_index = ipa_ctx->a5_pipe_index++;
 		ep->connect.src_pipe_index = ipa_ep_idx;
-		ep->rx_replenish_threshold = ipa_get_sys_yellow_wm(ep->sys)
-						/ ep->sys->rx_buff_sz;
+		/*
+		 * Determine how many buffers/descriptors remaining will
+		 * cause to drop below the yellow WM bar.
+		 */
+		if (ep->sys->rx_buff_sz)
+			ep->rx_replenish_threshold =
+			   ipa_get_sys_yellow_wm(ep->sys) / ep->sys->rx_buff_sz;
+		else
+			ep->rx_replenish_threshold = 0;
+		/* Only when the WAN pipes are setup, actual threshold will
+		 * be read from the register. So update LAN_CONS ep again with
+		 * right value.
+		 */
 		if (sys_in->client == IPA_CLIENT_APPS_WAN_CONS)
 			ipa_update_repl_threshold(IPA_CLIENT_APPS_LAN_CONS);
 	} else {
@@ -1211,6 +1407,12 @@ fail_gen:
 	return result;
 }
 
+/**
+ * ipa2_teardown_sys_pipe() - Teardown the system-BAM pipe and cleanup IPA EP
+ * @clnt_hdl:	[in] the handle obtained from ipa2_setup_sys_pipe
+ *
+ * Returns:	0 on success, negative on failure
+ */
 int ipa2_teardown_sys_pipe(u32 clnt_hdl)
 {
 	struct ipa_ep_context *ep;
@@ -1286,12 +1488,22 @@ int ipa2_teardown_sys_pipe(u32 clnt_hdl)
 	return 0;
 }
 
+/**
+ * ipa_tx_comp_usr_notify_release() - Callback function which will call the
+ * user supplied callback function to release the skb, or release it on
+ * its own if no callback function was supplied.
+ * @user1
+ * @user2
+ *
+ * This notified callback is for the destination client.
+ * This function is supplied in ipa_connect.
+ */
 static void ipa_tx_comp_usr_notify_release(void *user1, int user2)
 {
 	struct sk_buff *skb = (struct sk_buff *)user1;
 	int ep_idx = user2;
 
-	IPADBG("skb=%p ep=%d\n", skb, ep_idx);
+	IPADBG_LOW("skb=%p ep=%d\n", skb, ep_idx);
 
 	IPA_STATS_INC_CNT(ipa_ctx->stats.tx_pkts_compl);
 
@@ -1307,6 +1519,33 @@ static void ipa_tx_cmd_comp(void *user1, int user2)
 	kfree(user1);
 }
 
+/**
+ * ipa2_tx_dp() - Data-path tx handler
+ * @dst:	[in] which IPA destination to route tx packets to
+ * @skb:	[in] the packet to send
+ * @metadata:	[in] TX packet meta-data
+ *
+ * Data-path tx handler, this is used for both SW data-path which by-passes most
+ * IPA HW blocks AND the regular HW data-path for WLAN AMPDU traffic only. If
+ * dst is a "valid" CONS type, then SW data-path is used. If dst is the
+ * WLAN_AMPDU PROD type, then HW data-path for WLAN AMPDU is used. Anything else
+ * is an error. For errors, client needs to free the skb as needed. For success,
+ * IPA driver will later invoke client callback if one was supplied. That
+ * callback should free the skb. If no callback supplied, IPA driver will free
+ * the skb internally
+ *
+ * The function will use two descriptors for this send command
+ * (for A5_WLAN_AMPDU_PROD only one desciprtor will be sent),
+ * the first descriptor will be used to inform the IPA hardware that
+ * apps need to push data into the IPA (IP_PACKET_INIT immediate command).
+ * Once this send was done from SPS point-of-view the IPA driver will
+ * get notified by the supplied callback - ipa_sps_irq_tx_comp()
+ *
+ * ipa_sps_irq_tx_comp will call to the user supplied
+ * callback (from ipa_connect)
+ *
+ * Returns:	0 on success, negative on failure
+ */
 int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 		struct ipa_tx_meta *meta)
 {
@@ -1317,6 +1556,7 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 	struct ipa_sys_context *sys;
 	int src_ep_idx;
 	int num_frags, f;
+	gfp_t flag = GFP_ATOMIC | (ipa_ctx->use_dma_zone ? GFP_DMA : 0);
 
 	if (unlikely(!ipa_ctx)) {
 		IPAERR("IPA driver was not initialized\n");
@@ -1330,6 +1570,10 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 
 	num_frags = skb_shinfo(skb)->nr_frags;
 	if (num_frags) {
+		/* 1 desc is needed for the linear portion of skb;
+		 * 1 desc may be needed for the PACKET_INIT;
+		 * 1 desc for each frag
+		 */
 		desc = kzalloc(sizeof(*desc) * (num_frags + 2), GFP_ATOMIC);
 		if (!desc) {
 			IPAERR("failed to alloc desc array\n");
@@ -1340,6 +1584,15 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 		desc = &_desc[0];
 	}
 
+	/*
+	 * USB_CONS: PKT_INIT ep_idx = dst pipe
+	 * Q6_CONS: PKT_INIT ep_idx = sender pipe
+	 * A5_LAN_WAN_PROD: HW path ep_idx = sender pipe
+	 *
+	 * LAN TX: all PKT_INIT
+	 * WAN TX: PKT_INIT (cmd) + HW (data)
+	 *
+	 */
 	if (IPA_CLIENT_IS_CONS(dst)) {
 		src_ep_idx = ipa2_get_ep_mapping(IPA_CLIENT_APPS_LAN_WAN_PROD);
 		if (-1 == src_ep_idx) {
@@ -1368,8 +1621,8 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 	}
 
 	if (dst_ep_idx != -1) {
-		
-		cmd = kzalloc(sizeof(struct ipa_ip_packet_init), GFP_ATOMIC);
+		/* SW data path */
+		cmd = kzalloc(sizeof(struct ipa_ip_packet_init), flag);
 		if (!cmd) {
 			IPAERR("failed to alloc immediate command object\n");
 			goto fail_gen;
@@ -1402,7 +1655,7 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 			desc[2+f].len = skb_frag_size(desc[2+f].frag);
 		}
 
-		
+		/* don't free skb till frag mappings are released */
 		if (num_frags) {
 			desc[2+f-1].callback = desc[1].callback;
 			desc[2+f-1].user1 = desc[1].user1;
@@ -1417,7 +1670,7 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 		}
 		IPA_STATS_INC_CNT(ipa_ctx->stats.tx_sw_pkts);
 	} else {
-		
+		/* HW data path */
 		desc[0].pyld = skb->data;
 		desc[0].len = skb_headlen(skb);
 		desc[0].type = IPA_DATA_DESC_SKB;
@@ -1442,7 +1695,7 @@ int ipa2_tx_dp(enum ipa_client_type dst, struct sk_buff *skb,
 				desc[1+f].len = skb_frag_size(desc[1+f].frag);
 			}
 
-			
+			/* don't free skb till frag mappings are released */
 			desc[1+f-1].callback = desc[0].callback;
 			desc[1+f-1].user1 = desc[0].user1;
 			desc[1+f-1].user2 = desc[0].user2;
@@ -1522,8 +1775,8 @@ begin:
 		rx_pkt->data.dma_addr = dma_map_single(ipa_ctx->pdev, ptr,
 						     sys->rx_buff_sz,
 						     DMA_FROM_DEVICE);
-		if (rx_pkt->data.dma_addr == 0 ||
-				rx_pkt->data.dma_addr == ~0) {
+		if (dma_mapping_error(ipa_ctx->pdev,
+				rx_pkt->data.dma_addr)) {
 			pr_err_ratelimited("%s dma map fail %p for %p sys=%p\n",
 			       __func__, (void *)rx_pkt->data.dma_addr,
 			       ptr, sys);
@@ -1532,7 +1785,7 @@ begin:
 
 		sys->repl.cache[curr] = rx_pkt;
 		curr = next;
-		
+		/* ensure write is done before setting tail index */
 		mb();
 		atomic_set(&sys->repl.tail_idx, next);
 	}
@@ -1565,7 +1818,7 @@ static void ipa_replenish_wlan_rx_cache(struct ipa_sys_context *sys)
 	int ret;
 	u32 rx_len_cached = 0;
 
-	IPADBG("\n");
+	IPADBG_LOW("\n");
 
 	spin_lock_bh(&ipa_ctx->wc_memb.wlan_spinlock);
 	rx_len_cached = sys->len;
@@ -1622,6 +1875,8 @@ static void ipa_cleanup_wlan_rx_common_cache(void)
 	struct ipa_rx_pkt_wrapper *rx_pkt;
 	struct ipa_rx_pkt_wrapper *tmp;
 
+	spin_lock_bh(&ipa_ctx->wc_memb.wlan_spinlock);
+
 	list_for_each_entry_safe(rx_pkt, tmp,
 		&ipa_ctx->wc_memb.wlan_comm_desc_list, link) {
 		list_del(&rx_pkt->link);
@@ -1641,6 +1896,8 @@ static void ipa_cleanup_wlan_rx_common_cache(void)
 	if (ipa_ctx->wc_memb.wlan_comm_total_cnt != 0)
 		IPAERR("wlan comm buff total cnt: %d\n",
 			ipa_ctx->wc_memb.wlan_comm_total_cnt);
+
+	spin_unlock_bh(&ipa_ctx->wc_memb.wlan_spinlock);
 
 }
 
@@ -1674,18 +1931,20 @@ static void ipa_alloc_wlan_rx_common_cache(u32 size)
 		ptr = skb_put(rx_pkt->data.skb, IPA_WLAN_RX_BUFF_SZ);
 		rx_pkt->data.dma_addr = dma_map_single(ipa_ctx->pdev, ptr,
 				IPA_WLAN_RX_BUFF_SZ, DMA_FROM_DEVICE);
-		if (rx_pkt->data.dma_addr == 0 ||
-				rx_pkt->data.dma_addr == ~0) {
+		if (dma_mapping_error(ipa_ctx->pdev,
+				rx_pkt->data.dma_addr)) {
 			IPAERR("dma_map_single failure %p for %p\n",
 			       (void *)rx_pkt->data.dma_addr, ptr);
 			goto fail_dma_mapping;
 		}
 
+		spin_lock_bh(&ipa_ctx->wc_memb.wlan_spinlock);
 		list_add_tail(&rx_pkt->link,
 			&ipa_ctx->wc_memb.wlan_comm_desc_list);
 		rx_len_cached = ++ipa_ctx->wc_memb.wlan_comm_total_cnt;
 
 		ipa_ctx->wc_memb.wlan_comm_free_cnt++;
+		spin_unlock_bh(&ipa_ctx->wc_memb.wlan_spinlock);
 
 	}
 
@@ -1700,6 +1959,20 @@ fail_kmem_cache_alloc:
 }
 
 
+/**
+ * ipa_replenish_rx_cache() - Replenish the Rx packets cache.
+ *
+ * The function allocates buffers in the rx_pkt_wrapper_cache cache until there
+ * are IPA_RX_POOL_CEIL buffers in the cache.
+ *   - Allocate a buffer in the cache
+ *   - Initialized the packets link
+ *   - Initialize the packets work struct
+ *   - Allocate the packets socket buffer (skb)
+ *   - Fill the packets skb with data
+ *   - Make the packet DMAable
+ *   - Add the packet to the system pipe linked list
+ *   - Initiate a SPS transfer so that SPS driver will use this packet later.
+ */
 static void ipa_replenish_rx_cache(struct ipa_sys_context *sys)
 {
 	void *ptr;
@@ -1732,8 +2005,8 @@ static void ipa_replenish_rx_cache(struct ipa_sys_context *sys)
 		rx_pkt->data.dma_addr = dma_map_single(ipa_ctx->pdev, ptr,
 						     sys->rx_buff_sz,
 						     DMA_FROM_DEVICE);
-		if (rx_pkt->data.dma_addr == 0 ||
-				rx_pkt->data.dma_addr == ~0) {
+		if (dma_mapping_error(ipa_ctx->pdev,
+				rx_pkt->data.dma_addr)) {
 			IPAERR("dma_map_single failure %p for %p\n",
 			       (void *)rx_pkt->data.dma_addr, ptr);
 			goto fail_dma_mapping;
@@ -1818,10 +2091,9 @@ static void ipa_replenish_rx_cache_recycle(struct ipa_sys_context *sys)
 			ptr = skb_put(rx_pkt->data.skb, sys->rx_buff_sz);
 			rx_pkt->data.dma_addr = dma_map_single(ipa_ctx->pdev,
 				ptr, sys->rx_buff_sz, DMA_FROM_DEVICE);
-			if (rx_pkt->data.dma_addr == 0 ||
-				rx_pkt->data.dma_addr == ~0) {
-				IPAERR("dma_map_single failure %p for %p\n",
-					(void *)rx_pkt->data.dma_addr, ptr);
+			if (dma_mapping_error(ipa_ctx->pdev,
+				rx_pkt->data.dma_addr)) {
+				IPAERR("dma_map_single failure for rx_pkt\n");
 				goto fail_dma_mapping;
 			}
 		}
@@ -1884,7 +2156,7 @@ static void ipa_fast_replenish_rx_cache(struct ipa_sys_context *sys)
 		rx_len_cached = ++sys->len;
 		sys->repl_trig_cnt++;
 		curr = (curr + 1) % sys->repl.capacity;
-		
+		/* ensure write is done before setting head index */
 		mb();
 		atomic_set(&sys->repl.head_idx, curr);
 	}
@@ -1919,6 +2191,10 @@ static void replenish_rx_work_func(struct work_struct *work)
 	IPA_ACTIVE_CLIENTS_DEC_SIMPLE();
 }
 
+/**
+ * ipa_cleanup_rx() - release RX queue resources
+ *
+ */
 static void ipa_cleanup_rx(struct ipa_sys_context *sys)
 {
 	struct ipa_rx_pkt_wrapper *rx_pkt;
@@ -1965,7 +2241,7 @@ static struct sk_buff *ipa_skb_copy_for_client(struct sk_buff *skb, int len)
 
 	skb2 = __dev_alloc_skb(len + IPA_RX_BUFF_CLIENT_HEADROOM, GFP_KERNEL);
 	if (likely(skb2)) {
-		
+		/* Set the data pointer */
 		skb_reserve(skb2, IPA_RX_BUFF_CLIENT_HEADROOM);
 		memcpy(skb2->data, skb->data, len);
 		skb2->len = len;
@@ -1988,6 +2264,7 @@ static int ipa_lan_rx_pyld_hdlr(struct sk_buff *skb,
 	unsigned int used = *(unsigned int *)skb->cb;
 	unsigned int used_align = ALIGN(used, 32);
 	unsigned long unused = IPA_GENERIC_RX_BUFF_BASE_SZ - used;
+	u32 skb2_len;
 
 	IPA_DUMP_BUFF(skb->data, 0, skb->len);
 
@@ -1997,7 +2274,7 @@ static int ipa_lan_rx_pyld_hdlr(struct sk_buff *skb,
 	}
 
 	if (sys->len_partial) {
-		IPADBG("len_partial %d\n", sys->len_partial);
+		IPADBG_LOW("len_partial %d\n", sys->len_partial);
 		buf = skb_push(skb, sys->len_partial);
 		memcpy(buf, sys->prev_skb->data, sys->len_partial);
 		sys->len_partial = 0;
@@ -2006,8 +2283,10 @@ static int ipa_lan_rx_pyld_hdlr(struct sk_buff *skb,
 		goto begin;
 	}
 
+	/* this pipe has TX comp (status only) + mux-ed LAN RX data
+	 * (status+data) */
 	if (sys->len_rem) {
-		IPADBG("rem %d skb %d pad %d\n", sys->len_rem, skb->len,
+		IPADBG_LOW("rem %d skb %d pad %d\n", sys->len_rem, skb->len,
 				sys->len_pad);
 		if (sys->len_rem <= skb->len) {
 			if (sys->prev_skb) {
@@ -2057,7 +2336,7 @@ static int ipa_lan_rx_pyld_hdlr(struct sk_buff *skb,
 begin:
 	while (skb->len) {
 		sys->drop_packet = false;
-		IPADBG("LEN_REM %d\n", skb->len);
+		IPADBG_LOW("LEN_REM %d\n", skb->len);
 
 		if (skb->len < IPA_PKT_STATUS_SIZE) {
 			WARN_ON(sys->prev_skb != NULL);
@@ -2068,7 +2347,7 @@ begin:
 		}
 
 		status = (struct ipa_hw_pkt_status *)skb->data;
-		IPADBG("STATUS opcode=%d src=%d dst=%d len=%d\n",
+		IPADBG_LOW("STATUS opcode=%d src=%d dst=%d len=%d\n",
 				status->status_opcode, status->endp_src_idx,
 				status->endp_dest_idx, status->pkt_len);
 		if (sys->status_stat) {
@@ -2106,7 +2385,7 @@ begin:
 		if (status->status_mask & IPA_HW_PKT_STATUS_MASK_TAG_VALID) {
 			struct ipa_tag_completion *comp;
 
-			IPADBG("TAG packet arrived\n");
+			IPADBG_LOW("TAG packet arrived\n");
 			if (status->tag_f_2 == IPA_COOKIE) {
 				skb_pull(skb, IPA_PKT_STATUS_SIZE);
 				if (skb->len < sizeof(comp)) {
@@ -2133,16 +2412,20 @@ begin:
 			continue;
 		}
 		if (status->endp_dest_idx == (sys->ep - ipa_ctx->ep)) {
-			
+			/* RX data */
 			src_pipe = status->endp_src_idx;
 
+			/*
+			 * A packet which is received back to the AP after
+			 * there was no route match.
+			 */
 			if (!status->exception && !status->route_match)
 				sys->drop_packet = true;
 
 			if (skb->len == IPA_PKT_STATUS_SIZE &&
 					!status->exception) {
 				WARN_ON(sys->prev_skb != NULL);
-				IPADBG("Ins header in next buffer\n");
+				IPADBG_LOW("Ins header in next buffer\n");
 				sys->prev_skb = skb_copy(skb, GFP_KERNEL);
 				sys->len_partial =	 skb->len;
 				return rc;
@@ -2153,20 +2436,22 @@ begin:
 
 			len = status->pkt_len + pad_len_byte +
 				IPA_SIZE_DL_CSUM_META_TRAILER;
-			IPADBG("pad %d pkt_len %d len %d\n", pad_len_byte,
+			IPADBG_LOW("pad %d pkt_len %d len %d\n", pad_len_byte,
 					status->pkt_len, len);
 
 			if (status->exception ==
 					IPA_HW_PKT_STATUS_EXCEPTION_DEAGGR) {
-				IPADBG("Dropping packet on DeAggr Exception\n");
+				IPADBG_LOW("Dropping packet");
+				IPADBG_LOW(" on DeAggr Exception\n");
 				sys->drop_packet = true;
 			}
 
-			skb2 = ipa_skb_copy_for_client(skb,
-				status->pkt_len + IPA_PKT_STATUS_SIZE);
+			skb2_len = status->pkt_len + IPA_PKT_STATUS_SIZE;
+			skb2_len = min(skb2_len, skb->len);
+			skb2 = ipa_skb_copy_for_client(skb, skb2_len);
 			if (likely(skb2)) {
 				if (skb->len < len + IPA_PKT_STATUS_SIZE) {
-					IPADBG("SPL skb len %d len %d\n",
+					IPADBG_LOW("SPL skb len %d len %d\n",
 							skb->len, len);
 					sys->prev_skb = skb2;
 					sys->len_rem = len - skb->len +
@@ -2176,7 +2461,7 @@ begin:
 				} else {
 					skb_trim(skb2, status->pkt_len +
 							IPA_PKT_STATUS_SIZE);
-					IPADBG("rx avail for %d\n",
+					IPADBG_LOW("rx avail for %d\n",
 							status->endp_dest_idx);
 					if (sys->drop_packet) {
 						dev_kfree_skb_any(skb2);
@@ -2218,13 +2503,14 @@ begin:
 						IPA_PKT_STATUS_SIZE);
 				}
 			}
-			
+			/* TX comp */
 			ipa_wq_write_done_status(src_pipe);
-			IPADBG("tx comp imp for %d\n", src_pipe);
+			IPADBG_LOW("tx comp imp for %d\n", src_pipe);
 		} else {
-			
+			/* TX comp */
 			ipa_wq_write_done_status(status->endp_src_idx);
-			IPADBG("tx comp exp for %d\n", status->endp_src_idx);
+			IPADBG_LOW
+				("tx comp exp for %d\n", status->endp_src_idx);
 			skb_pull(skb, IPA_PKT_STATUS_SIZE);
 			IPA_STATS_INC_CNT(ipa_ctx->stats.stat_compl);
 			IPA_STATS_DEC_CNT(
@@ -2259,13 +2545,13 @@ static void wan_rx_handle_splt_pyld(struct sk_buff *skb,
 {
 	struct sk_buff *skb2;
 
-	IPADBG("rem %d skb %d\n", sys->len_rem, skb->len);
+	IPADBG_LOW("rem %d skb %d\n", sys->len_rem, skb->len);
 	if (sys->len_rem <= skb->len) {
 		if (sys->prev_skb) {
 			skb2 = join_prev_skb(sys->prev_skb, skb,
 					sys->len_rem);
 			if (likely(skb2)) {
-				IPADBG(
+				IPADBG_LOW(
 					"removing Status element from skb and sending to WAN client");
 				skb_pull(skb2, IPA_PKT_STATUS_SIZE);
 				skb2->truesize = skb2->len +
@@ -2315,19 +2601,23 @@ static int ipa_wan_rx_pyld_hdlr(struct sk_buff *skb,
 					IPA_RECEIVE, (unsigned long)(skb));
 		return rc;
 	}
+	/*
+	 * payload splits across 2 buff or more,
+	 * take the start of the payload from prev_skb
+	 */
 	if (sys->len_rem)
 		wan_rx_handle_splt_pyld(skb, sys);
 
 
 	while (skb->len) {
-		IPADBG("LEN_REM %d\n", skb->len);
+		IPADBG_LOW("LEN_REM %d\n", skb->len);
 		if (skb->len < IPA_PKT_STATUS_SIZE) {
 			IPAERR("status straddles buffer\n");
 			WARN_ON(1);
 			goto bail;
 		}
 		status = (struct ipa_hw_pkt_status *)skb->data;
-		IPADBG("STATUS opcode=%d src=%d dst=%d len=%d\n",
+		IPADBG_LOW("STATUS opcode=%d src=%d dst=%d len=%d\n",
 				status->status_opcode, status->endp_src_idx,
 				status->endp_dest_idx, status->pkt_len);
 
@@ -2358,7 +2648,7 @@ static int ipa_wan_rx_pyld_hdlr(struct sk_buff *skb,
 			goto bail;
 		}
 		if (status->pkt_len == 0) {
-			IPADBG("Skip aggr close status\n");
+			IPADBG_LOW("Skip aggr close status\n");
 			skb_pull(skb, IPA_PKT_STATUS_SIZE);
 			IPA_STATS_DEC_CNT(ipa_ctx->stats.rx_pkts);
 			IPA_STATS_INC_CNT(ipa_ctx->stats.wan_aggr_close);
@@ -2371,21 +2661,25 @@ static int ipa_wan_rx_pyld_hdlr(struct sk_buff *skb,
 			WARN_ON(1);
 			goto bail;
 		}
-		
+		/* RX data */
 		if (skb->len == IPA_PKT_STATUS_SIZE) {
 			IPAERR("Ins header in next buffer\n");
 			WARN_ON(1);
 			goto bail;
 		}
 		qmap_hdr = *(u32 *)(status+1);
+		/*
+		 * Take the pkt_len_with_pad from the last 2 bytes of the QMAP
+		 * header
+		 */
 
-		
+		/*QMAP is BE: convert the pkt_len field from BE to LE*/
 		pkt_len_with_pad = ntohs((qmap_hdr>>16) & 0xffff);
-		IPADBG("pkt_len with pad %d\n", pkt_len_with_pad);
-		
+		IPADBG_LOW("pkt_len with pad %d\n", pkt_len_with_pad);
+		/*get the CHECKSUM_PROCESS bit*/
 		checksum_trailer_exists = status->status_mask &
 				IPA_HW_PKT_STATUS_MASK_CKSUM_PROCESS;
-		IPADBG("checksum_trailer_exists %d\n",
+		IPADBG_LOW("checksum_trailer_exists %d\n",
 				checksum_trailer_exists);
 
 		frame_len = IPA_PKT_STATUS_SIZE +
@@ -2393,21 +2687,25 @@ static int ipa_wan_rx_pyld_hdlr(struct sk_buff *skb,
 			    pkt_len_with_pad;
 		if (checksum_trailer_exists)
 			frame_len += IPA_DL_CHECKSUM_LENGTH;
-		IPADBG("frame_len %d\n", frame_len);
+		IPADBG_LOW("frame_len %d\n", frame_len);
 
 		skb2 = skb_clone(skb, GFP_KERNEL);
 		if (likely(skb2)) {
+			/*
+			 * the len of actual data is smaller than expected
+			 * payload split across 2 buff
+			 */
 			if (skb->len < frame_len) {
-				IPADBG("SPL skb len %d len %d\n",
+				IPADBG_LOW("SPL skb len %d len %d\n",
 						skb->len, frame_len);
 				sys->prev_skb = skb2;
 				sys->len_rem = frame_len - skb->len;
 				skb_pull(skb, skb->len);
 			} else {
 				skb_trim(skb2, frame_len);
-				IPADBG("rx avail for %d\n",
+				IPADBG_LOW("rx avail for %d\n",
 						status->endp_dest_idx);
-				IPADBG(
+				IPADBG_LOW(
 					"removing Status element from skb and sending to WAN client");
 				skb_pull(skb2, IPA_PKT_STATUS_SIZE);
 				skb2->truesize = skb2->len +
@@ -2455,6 +2753,10 @@ static int ipa_rx_pyld_hdlr(struct sk_buff *rx_skb, struct ipa_sys_context *sys)
 	IPA_STATS_INC_CNT(ipa_ctx->stats.rx_pkts);
 	IPA_STATS_EXCP_CNT(mux_hdr->flags, ipa_ctx->stats.rx_excp_pkts);
 
+	/*
+	 * Any packets arriving over AMPDU_TX should be dispatched
+	 * to the regular WLAN RX data-path.
+	 */
 	if (unlikely(src_pipe == WLAN_AMPDU_TX_EP))
 		src_pipe = WLAN_PROD_TX_EP;
 
@@ -2471,6 +2773,11 @@ static int ipa_rx_pyld_hdlr(struct sk_buff *rx_skb, struct ipa_sys_context *sys)
 
 	pull_len = sizeof(struct ipa_a5_mux_hdr);
 
+	/*
+	 * IP packet starts on word boundary
+	 * remove the MUX header and any padding and pass the frame to
+	 * the client which registered a rx callback on the "src pipe"
+	 */
 	padding = ep->cfg.hdr.hdr_len & 0x3;
 	if (padding)
 		pull_len += 4 - padding;
@@ -2531,8 +2838,14 @@ void ipa_lan_rx_cb(void *priv, enum ipa_dp_evt_type evt, unsigned long data)
 	else
 		skb_pull(rx_skb, IPA_PKT_STATUS_SIZE);
 
+	/* Metadata Info
+	   ------------------------------------------
+	   |   3     |   2     |    1        |  0   |
+	   | fw_desc | vdev_id | qmap mux id | Resv |
+	   ------------------------------------------
+	 */
 	*(u16 *)rx_skb->cb = ((metadata >> 16) & 0xFFFF);
-	IPADBG("meta_data: 0x%x cb: 0x%x\n",
+	IPADBG_LOW("meta_data: 0x%x cb: 0x%x\n",
 			metadata, *(u32 *)rx_skb->cb);
 
 	ep->client_notify(ep->priv, IPA_RECEIVE, (unsigned long)(rx_skb));
@@ -2615,7 +2928,7 @@ static void ipa_wlan_wq_rx_common(struct ipa_sys_context *sys, u32 size)
 static void ipa_dma_memcpy_notify(struct ipa_sys_context *sys,
 	struct sps_iovec *iovec)
 {
-	IPADBG("ENTER.\n");
+	IPADBG_LOW("ENTER.\n");
 	if (unlikely(list_empty(&sys->head_desc_list))) {
 		IPAERR("descriptor list is empty!\n");
 		WARN_ON(1);
@@ -2644,6 +2957,14 @@ static void ipa_wq_rx_avail(struct work_struct *work)
 	ipa_wq_rx_common(sys, 0);
 }
 
+/**
+ * ipa_sps_irq_rx_no_aggr_notify() - Callback function which will be called by
+ * the SPS driver after a Rx operation is complete.
+ * Called in an interrupt context.
+ * @notify:	SPS driver supplied notification struct
+ *
+ * This function defer the work for this event to a workqueue.
+ */
 void ipa_sps_irq_rx_no_aggr_notify(struct sps_event_notify *notify)
 {
 	struct ipa_rx_pkt_wrapper *rx_pkt;
@@ -2654,7 +2975,8 @@ void ipa_sps_irq_rx_no_aggr_notify(struct sps_event_notify *notify)
 		if (IPA_CLIENT_IS_APPS_CONS(rx_pkt->sys->ep->client))
 			atomic_set(&ipa_ctx->sps_pm.eot_activity, 1);
 		rx_pkt->len = notify->data.transfer.iovec.size;
-		IPADBG("event %d notified sys=%p len=%u\n", notify->event_id,
+		IPADBG_LOW
+			("event %d notified sys=%p len=%u\n", notify->event_id,
 				notify->user, rx_pkt->len);
 		queue_work(rx_pkt->sys->wq, &rx_pkt->work);
 		break;
@@ -2815,7 +3137,7 @@ static int ipa_assign_policy(struct ipa_sys_connect_params *in,
 						ipa_adjust_ra_buff_base_sz(
 						in->ipa_ep_cfg.
 							aggr.aggr_byte_limit)));
-						
+						/* disable ipa_status */
 						sys->ep->status.
 							status_en = false;
 						sys->rx_buff_sz =
@@ -2940,20 +3262,32 @@ static int ipa_assign_policy(struct ipa_sys_connect_params *in,
 	return 0;
 }
 
+/**
+ * ipa_tx_client_rx_notify_release() - Callback function
+ * which will call the user supplied callback function to
+ * release the skb, or release it on its own if no callback
+ * function was supplied
+ *
+ * @user1: [in] - Data Descriptor
+ * @user2: [in] - endpoint idx
+ *
+ * This notified callback is for the destination client
+ * This function is supplied in ipa_tx_dp_mul
+ */
 static void ipa_tx_client_rx_notify_release(void *user1, int user2)
 {
 	struct ipa_tx_data_desc *dd = (struct ipa_tx_data_desc *)user1;
 	int ep_idx = user2;
 
-	IPADBG("Received data desc anchor:%p\n", dd);
+	IPADBG_LOW("Received data desc anchor:%p\n", dd);
 
 	atomic_inc(&ipa_ctx->ep[ep_idx].avail_fifo_desc);
 	ipa_ctx->ep[ep_idx].wstats.rx_pkts_status_rcvd++;
 
-  
-	IPADBG("ep=%d fifo_desc_free_count=%d\n",
+  /* wlan host driver waits till tx complete before unload */
+	IPADBG_LOW("ep=%d fifo_desc_free_count=%d\n",
 		ep_idx, atomic_read(&ipa_ctx->ep[ep_idx].avail_fifo_desc));
-	IPADBG("calling client notify callback with priv:%p\n",
+	IPADBG_LOW("calling client notify callback with priv:%p\n",
 		ipa_ctx->ep[ep_idx].priv);
 
 	if (ipa_ctx->ep[ep_idx].client_notify) {
@@ -2962,6 +3296,17 @@ static void ipa_tx_client_rx_notify_release(void *user1, int user2)
 		ipa_ctx->ep[ep_idx].wstats.rx_hd_reply++;
 	}
 }
+/**
+ * ipa_tx_client_rx_pkt_status() - Callback function
+ * which will call the user supplied callback function to
+ * increase the available fifo descriptor
+ *
+ * @user1: [in] - Data Descriptor
+ * @user2: [in] - endpoint idx
+ *
+ * This notified callback is for the destination client
+ * This function is supplied in ipa_tx_dp_mul
+ */
 static void ipa_tx_client_rx_pkt_status(void *user1, int user2)
 {
 	int ep_idx = user2;
@@ -2971,10 +3316,29 @@ static void ipa_tx_client_rx_pkt_status(void *user1, int user2)
 }
 
 
+/**
+ * ipa2_tx_dp_mul() - Data-path tx handler for multiple packets
+ * @src: [in] - Client that is sending data
+ * @ipa_tx_data_desc:	[in] data descriptors from wlan
+ *
+ * this is used for to transfer data descriptors that received
+ * from WLAN1_PROD pipe to IPA HW
+ *
+ * The function will send data descriptors from WLAN1_PROD (one
+ * at a time) using sps_transfer_one. Will set EOT flag for last
+ * descriptor Once this send was done from SPS point-of-view the
+ * IPA driver will get notified by the supplied callback -
+ * ipa_sps_irq_tx_no_aggr_notify()
+ *
+ * ipa_sps_irq_tx_no_aggr_notify will call to the user supplied
+ * callback (from ipa_connect)
+ *
+ * Returns:	0 on success, negative on failure
+ */
 int ipa2_tx_dp_mul(enum ipa_client_type src,
 			struct ipa_tx_data_desc *data_desc)
 {
-	
+	/* The second byte in wlan header holds qmap id */
 #define IPA_WLAN_HDR_QMAP_ID_OFFSET 1
 	struct ipa_tx_data_desc *entry;
 	struct ipa_sys_context *sys;
@@ -2987,7 +3351,7 @@ int ipa2_tx_dp_mul(enum ipa_client_type src,
 		return -EINVAL;
 	}
 
-	IPADBG("Received data desc anchor:%p\n", data_desc);
+	IPADBG_LOW("Received data desc anchor:%p\n", data_desc);
 
 	spin_lock_bh(&ipa_ctx->wc_memb.ipa_tx_mul_spinlock);
 
@@ -2996,7 +3360,7 @@ int ipa2_tx_dp_mul(enum ipa_client_type src,
 		IPAERR("dest EP does not exist.\n");
 		goto fail_send;
 	}
-	IPADBG("ep idx:%d\n", ep_idx);
+	IPADBG_LOW("ep idx:%d\n", ep_idx);
 	sys = ipa_ctx->ep[ep_idx].sys;
 
 	if (unlikely(ipa_ctx->ep[ep_idx].valid == 0)) {
@@ -3005,22 +3369,22 @@ int ipa2_tx_dp_mul(enum ipa_client_type src,
 	}
 	sys->ep->wstats.rx_hd_rcvd++;
 
-	
+	/* Calculate the number of descriptors */
 	num_desc = 0;
 	list_for_each_entry(entry, &data_desc->link, link) {
 		num_desc++;
 	}
-	IPADBG("Number of Data Descriptors:%d", num_desc);
+	IPADBG_LOW("Number of Data Descriptors:%d", num_desc);
 
 	if (atomic_read(&sys->ep->avail_fifo_desc) < num_desc) {
 		IPAERR("Insufficient data descriptors available\n");
 		goto fail_send;
 	}
 
-	
+	/* Assign callback only for last data descriptor */
 	cnt = 0;
 	list_for_each_entry(entry, &data_desc->link, link) {
-		IPADBG("Parsing data desc :%d\n", cnt);
+		IPADBG_LOW("Parsing data desc :%d\n", cnt);
 		cnt++;
 		((u8 *)entry->pyld_buffer)[IPA_WLAN_HDR_QMAP_ID_OFFSET] =
 			(u8)sys->ep->cfg.meta.qmap_id;
@@ -3029,18 +3393,18 @@ int ipa2_tx_dp_mul(enum ipa_client_type src,
 		desc.type = IPA_DATA_DESC_SKB;
 		desc.user1 = data_desc;
 		desc.user2 = ep_idx;
-		IPADBG("priv:%p pyld_buf:0x%p pyld_len:%d\n",
+		IPADBG_LOW("priv:%p pyld_buf:0x%p pyld_len:%d\n",
 			entry->priv, desc.pyld, desc.len);
 
-		
+		/* In case of last descriptor populate callback */
 		if (cnt == num_desc) {
-			IPADBG("data desc:%p\n", data_desc);
+			IPADBG_LOW("data desc:%p\n", data_desc);
 			desc.callback = ipa_tx_client_rx_notify_release;
 		} else {
 			desc.callback = ipa_tx_client_rx_pkt_status;
 		}
 
-		IPADBG("calling ipa_send_one()\n");
+		IPADBG_LOW("calling ipa_send_one()\n");
 		if (ipa_send_one(sys, &desc, true)) {
 			IPAERR("fail to send skb\n");
 			sys->ep->wstats.rx_pkt_leak += (cnt-1);
@@ -3052,7 +3416,7 @@ int ipa2_tx_dp_mul(enum ipa_client_type src,
 			atomic_dec(&sys->ep->avail_fifo_desc);
 
 		sys->ep->wstats.rx_pkts_rcvd++;
-		IPADBG("ep=%d fifo desc=%d\n",
+		IPADBG_LOW("ep=%d fifo desc=%d\n",
 			ep_idx, atomic_read(&sys->ep->avail_fifo_desc));
 	}
 
@@ -3091,6 +3455,7 @@ void ipa2_free_skb(struct ipa_rx_data *data)
 }
 
 
+/* Functions added to support kernel tests */
 
 int ipa2_sys_setup(struct ipa_sys_connect_params *sys_in,
 			unsigned long *ipa_bam_hdl,
@@ -3238,6 +3603,12 @@ int ipa2_sys_update_gsi_hdls(u32 clnt_hdl, unsigned long gsi_ch_hdl,
 }
 
 
+/**
+ * ipa_adjust_ra_buff_base_sz()
+ *
+ * Return value: the largest power of two which is smaller
+ * than the input value
+ */
 static u32 ipa_adjust_ra_buff_base_sz(u32 aggr_byte_limit)
 {
 	aggr_byte_limit += IPA_MTU;

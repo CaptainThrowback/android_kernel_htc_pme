@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,7 +24,6 @@
 #include <linux/device.h>
 #include <linux/delay.h>
 #include <linux/workqueue.h>
-#include <linux/debugfs.h>
 
 #include <soc/qcom/msm_qmi_interface.h>
 #include <soc/qcom/service-locator.h>
@@ -69,47 +68,6 @@ DEFINE_MUTEX(service_init_mutex);
 struct pd_qmi_data service_locator;
 
 
-static ssize_t show_service_locator_status(struct class *cl,
-						struct class_attribute *attr,
-						char *buf)
-{
-	return scnprintf(buf, PAGE_SIZE, "%x\n", locator_status);
-}
-
-static ssize_t store_service_locator_status(struct class *cl,
-						struct class_attribute *attr,
-						const char *buf, size_t size)
-{
-	u32 val;
-
-	if (kstrtos32(buf, 10, &val) < 0)
-		goto err;
-	if (val != LOCATOR_NOT_PRESENT && val != LOCATOR_PRESENT)
-		goto err;
-
-	mutex_lock(&service_init_mutex);
-	locator_status = val;
-	complete_all(&locator_status_known);
-	mutex_unlock(&service_init_mutex);
-	return size;
-err:
-	pr_err("Invalid input parameters\n");
-	return -EINVAL;
-}
-
-static struct class_attribute service_locator_class_attr[] = {
-	__ATTR(service_locator_status, S_IRUGO | S_IWUSR,
-			show_service_locator_status,
-			store_service_locator_status),
-	__ATTR_NULL,
-};
-
-static struct class service_locator_class  = {
-	.name = "service_locator",
-	.owner = THIS_MODULE,
-	.class_attrs = service_locator_class_attr,
-};
-
 static int service_locator_svc_event_notify(struct notifier_block *this,
 				      unsigned long code,
 				      void *_cmd)
@@ -143,7 +101,7 @@ static void service_locator_svc_arrive(struct work_struct *work)
 {
 	int rc = 0;
 
-	
+	/* Create a Local client port for QMI communication */
 	mutex_lock(&service_locator.service_mutex);
 	service_locator.clnt_handle =
 			qmi_handle_create(service_locator_clnt_notify, NULL);
@@ -154,7 +112,7 @@ static void service_locator_svc_arrive(struct work_struct *work)
 		return;
 	}
 
-	
+	/* Connect to service */
 	rc = qmi_connect_to_service(service_locator.clnt_handle,
 		SERVREG_LOC_SERVICE_ID_V01, SERVREG_LOC_SERVICE_VERS_V01,
 		SERVREG_LOC_SERVICE_INSTANCE_ID);
@@ -218,6 +176,11 @@ static int servreg_loc_send_msg(struct msg_desc *req_desc,
 {
 	int rc;
 
+	/*
+	 * Send msg and get response. There is a chance that the service went
+	 * away since the time we last checked for it to be available and
+	 * actually made this call. In that case the call just fails.
+	 */
 	rc = qmi_send_req_wait(service_locator.clnt_handle, req_desc, req,
 		sizeof(*req), resp_desc, resp, sizeof(*resp),
 		msecs_to_jiffies(QMI_SERVREG_LOC_SERVER_TIMEOUT));
@@ -227,7 +190,7 @@ static int servreg_loc_send_msg(struct msg_desc *req_desc,
 		return rc;
 	}
 
-	
+	/* Check the response */
 	if (QMI_RESP_BIT_SHIFT(resp->resp.result) != QMI_RESULT_SUCCESS_V01) {
 		pr_err("QMI request for client %s failed 0x%x\n",
 			pd->client_name, QMI_RESP_BIT_SHIFT(resp->resp.error));
@@ -239,8 +202,8 @@ static int servreg_loc_send_msg(struct msg_desc *req_desc,
 static int service_locator_send_msg(struct pd_qmi_client_data *pd)
 {
 	struct msg_desc req_desc, resp_desc;
-	struct qmi_servreg_loc_get_domain_list_resp_msg_v01 *resp;
-	struct qmi_servreg_loc_get_domain_list_req_msg_v01 *req;
+	struct qmi_servreg_loc_get_domain_list_resp_msg_v01 *resp = NULL;
+	struct qmi_servreg_loc_get_domain_list_req_msg_v01 *req = NULL;
 	int rc;
 	int db_rev_count = 0, domains_read = 0;
 
@@ -265,7 +228,7 @@ static int service_locator_send_msg(struct pd_qmi_client_data *pd)
 		rc = -ENOMEM;
 		goto out;
 	}
-	
+	/* Prepare req and response message formats */
 	req_desc.msg_id = QMI_SERVREG_LOC_GET_DOMAIN_LIST_REQ_V01;
 	req_desc.max_msg_len =
 		QMI_SERVREG_LOC_GET_DOMAIN_LIST_REQ_MSG_V01_MAX_MSG_LEN;
@@ -276,7 +239,7 @@ static int service_locator_send_msg(struct pd_qmi_client_data *pd)
 		QMI_SERVREG_LOC_GET_DOMAIN_LIST_RESP_MSG_V01_MAX_MSG_LEN;
 	resp_desc.ei_array = qmi_servreg_loc_get_domain_list_resp_msg_v01_ei;
 
-	
+	/* Prepare req and response message */
 	strlcpy(req->service_name, pd->service_name,
 		QMI_SERVREG_LOC_NAME_LENGTH_V01 + 1);
 	req->domain_offset_valid = true;
@@ -294,10 +257,11 @@ static int service_locator_send_msg(struct pd_qmi_client_data *pd)
 		if (!domains_read) {
 			db_rev_count = pd->db_rev_count = resp->db_rev_count;
 			pd->total_domains = resp->total_domains;
-			if (!pd->total_domains && resp->domain_list_len) {
-				pr_err("total domains not set\n");
-				pd->total_domains = resp->domain_list_len;
+			if (!resp->total_domains) {
+				pr_err("No matching domains found\n");
+				goto out;
 			}
+
 			pd->domain_list = kmalloc(
 					sizeof(struct servreg_loc_entry_v01) *
 					resp->total_domains, GFP_KERNEL);
@@ -314,7 +278,11 @@ static int service_locator_send_msg(struct pd_qmi_client_data *pd)
 			rc = -EAGAIN;
 			goto out;
 		}
-		
+		if (resp->domain_list_len >  resp->total_domains) {
+			/* Always read total_domains from the response msg */
+			resp->domain_list_len = resp->total_domains;
+		}
+		/* Copy the response*/
 		store_get_domain_list_response(pd, resp, domains_read);
 		domains_read += resp->domain_list_len;
 	} while (domains_read < resp->total_domains);
@@ -445,82 +413,3 @@ int find_subsys(const char *pd_path, char *subsys)
 	return 0;
 }
 EXPORT_SYMBOL(find_subsys);
-
-static struct pd_qmi_client_data test_data;
-
-static ssize_t show_servloc(struct seq_file *f, void *unused)
-{
-	int rc = 0, i = 0;
-	char subsys[QMI_SERVREG_LOC_NAME_LENGTH_V01];
-
-	rc = get_service_location(&test_data);
-	if (rc) {
-		seq_printf(f, "Failed to get process domain!, rc = %d\n", rc);
-		return -EIO;
-	}
-
-	seq_printf(f, "Service Name: %s\tTotal Domains: %d\n",
-			test_data.service_name, test_data.total_domains);
-	for (i = 0; i < test_data.total_domains; i++) {
-		seq_printf(f, "Instance ID: %d\t ",
-			test_data.domain_list[i].instance_id);
-		seq_printf(f, "Domain Name: %s\n",
-			test_data.domain_list[i].name);
-		rc = find_subsys(test_data.domain_list[i].name, subsys);
-		if (rc < 0)
-			seq_printf(f, "No valid subsys found for %s!\n",
-						test_data.domain_list[i].name);
-		else
-			seq_printf(f, "Subsys: %s\n", subsys);
-	}
-	return 0;
-}
-
-static ssize_t store_servloc(struct file *fp, const char __user *buf,
-						size_t count, loff_t *unused)
-{
-	if (!buf)
-		return -EIO;
-	snprintf(test_data.service_name, sizeof(test_data.service_name),
-			"%.*s", (int) min((size_t)count - 1,
-			(sizeof(test_data.service_name) - 1)), buf);
-	return count;
-}
-
-static int servloc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, (void *)show_servloc, inode->i_private);
-}
-
-static const struct file_operations servloc_fops = {
-	.open		= servloc_open,
-	.read		= seq_read,
-	.write		= store_servloc,
-	.llseek		= seq_lseek,
-	.release	= seq_release,
-};
-
-static struct dentry *test_servloc_file;
-
-static int __init service_locator_init(void)
-{
-	if (!enable)
-		locator_status = LOCATOR_NOT_PRESENT;
-
-	class_register(&service_locator_class);
-	test_servloc_file = debugfs_create_file("test_servloc",
-				S_IRUGO | S_IWUSR, NULL, NULL,
-				&servloc_fops);
-	if (!test_servloc_file)
-		pr_err("Could not create test_servloc debugfs entry!");
-	return 0;
-}
-
-static void __exit service_locator_exit(void)
-{
-	class_unregister(&service_locator_class);
-	debugfs_remove(test_servloc_file);
-}
-
-module_init(service_locator_init);
-module_exit(service_locator_exit);

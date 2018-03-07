@@ -35,11 +35,13 @@
 #include <proto/bcmevent.h>
 #include <proto/802.11.h>
 
+/* Table of event name strings for UIs and debugging dumps */
 typedef struct {
 	uint event;
 	const char *name;
 } bcmevent_name_str_t;
 
+/* Use the actual name for event tracing */
 #define BCMEVENT_NAME(_event) {(_event), #_event}
 
 static const bcmevent_name_str_t bcmevent_names[] = {
@@ -81,13 +83,13 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 	BCMEVENT_NAME(WLC_E_PFN_NET_LOST),
 #if defined(IBSS_PEER_DISCOVERY_EVENT)
 	BCMEVENT_NAME(WLC_E_IBSS_ASSOC),
-#endif 
+#endif /* defined(IBSS_PEER_DISCOVERY_EVENT) */
 	BCMEVENT_NAME(WLC_E_RADIO),
 	BCMEVENT_NAME(WLC_E_PSM_WATCHDOG),
 #if defined(BCMCCX) && defined(CCX_SDK)
 	BCMEVENT_NAME(WLC_E_CCX_ASSOC_START),
 	BCMEVENT_NAME(WLC_E_CCX_ASSOC_ABORT),
-#endif 
+#endif /* BCMCCX && CCX_SDK */
 	BCMEVENT_NAME(WLC_E_PROBREQ_MSG),
 	BCMEVENT_NAME(WLC_E_SCAN_CONFIRM_IND),
 	BCMEVENT_NAME(WLC_E_PSK_SUP),
@@ -112,7 +114,7 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 #ifdef BCMWAPI_WAI
 	BCMEVENT_NAME(WLC_E_WAI_STA_EVENT),
 	BCMEVENT_NAME(WLC_E_WAI_MSG),
-#endif 
+#endif /* BCMWAPI_WAI */
 	BCMEVENT_NAME(WLC_E_ESCAN_RESULT),
 	BCMEVENT_NAME(WLC_E_ACTION_FRAME_OFF_CHAN_COMPLETE),
 #ifdef WLP2P
@@ -138,11 +140,11 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 	BCMEVENT_NAME(WLC_E_BEACON_FRAME_RX),
 #ifdef WLTDLS
 	BCMEVENT_NAME(WLC_E_TDLS_PEER_EVENT),
-#endif 
+#endif /* WLTDLS */
 	BCMEVENT_NAME(WLC_E_NATIVE),
 #ifdef WLPKTDLYSTAT
 	BCMEVENT_NAME(WLC_E_PKTDELAY_IND),
-#endif 
+#endif /* WLPKTDLYSTAT */
 	BCMEVENT_NAME(WLC_E_SERVICE_FOUND),
 	BCMEVENT_NAME(WLC_E_GAS_FRAGMENT_RX),
 	BCMEVENT_NAME(WLC_E_GAS_COMPLETE),
@@ -150,7 +152,7 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 	BCMEVENT_NAME(WLC_E_P2PO_DEL_DEVICE),
 #ifdef WLWNM
 	BCMEVENT_NAME(WLC_E_WNM_STA_SLEEP),
-#endif 
+#endif /* WLWNM */
 #if defined(WL_PROXDETECT)
 	BCMEVENT_NAME(WLC_E_PROXD),
 #endif
@@ -163,11 +165,10 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 	BCMEVENT_NAME(WLC_E_TXFAIL_THRESH),
 #ifdef WLAIBSS
 	BCMEVENT_NAME(WLC_E_AIBSS_TXFAIL),
-#endif 
+#endif /* WLAIBSS */
 #ifdef GSCAN_SUPPORT
 	BCMEVENT_NAME(WLC_E_PFN_GSCAN_FULL_RESULT),
-	BCMEVENT_NAME(WLC_E_PFN_SWC),
-#endif 
+#endif /* GSCAN_SUPPORT */
 #ifdef WLBSSLOAD_REPORT
 	BCMEVENT_NAME(WLC_E_BSS_LOAD),
 #endif
@@ -176,7 +177,7 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 #endif
 #ifdef WLFBT
 	BCMEVENT_NAME(WLC_E_FBT_AUTH_REQ_IND),
-#endif 
+#endif /* WLFBT */
 	BCMEVENT_NAME(WLC_E_AUTHORIZED),
 	BCMEVENT_NAME(WLC_E_PROBREQ_MSG_RX),
 	BCMEVENT_NAME(WLC_E_CSA_START_IND),
@@ -190,6 +191,11 @@ static const bcmevent_name_str_t bcmevent_names[] = {
 
 const char *bcmevent_get_name(uint event_type)
 {
+	/* note:  first coded this as a static const but some
+	 * ROMs already have something called event_name so
+	 * changed it so we don't have a variable for the
+	 * 'unknown string
+	 */
 	const char *event_name = NULL;
 
 	uint idx;
@@ -201,12 +207,18 @@ const char *bcmevent_get_name(uint event_type)
 		}
 	}
 
+	/* if we find an event name in the array, return it.
+	 * otherwise return unknown string.
+	 */
 	return ((event_name) ? event_name : "Unknown Event");
 }
 
 void
 wl_event_to_host_order(wl_event_msg_t * evt)
 {
+	/* Event struct members passed from dongle to host are stored in network
+	* byte order. Convert all members to host-order.
+	*/
 	evt->event_type = ntoh32(evt->event_type);
 	evt->flags = ntoh16(evt->flags);
 	evt->status = ntoh32(evt->status);
@@ -219,6 +231,9 @@ wl_event_to_host_order(wl_event_msg_t * evt)
 void
 wl_event_to_network_order(wl_event_msg_t * evt)
 {
+	/* Event struct members passed from dongle to host are stored in network
+	* byte order. Convert all members to host-order.
+	*/
 	evt->event_type = hton32(evt->event_type);
 	evt->flags = hton16(evt->flags);
 	evt->status = hton32(evt->status);
@@ -231,17 +246,19 @@ int
 is_wlc_event_frame_tmp(void *pktdata, uint pktlen, uint16 exp_usr_subtype,
         bcm_event_msg_u_t *out_event)
 {
-        uint16 len;
+        uint16 evlen;
         uint16 subtype;
         uint16 usr_subtype;
         bcm_event_t *bcm_event;
         uint8 *pktend;
+        uint8 *evend;
         int err = BCME_OK;
+        uint32 data_len;
 
         pktend = (uint8 *)pktdata + pktlen;
         bcm_event = (bcm_event_t *)pktdata;
 
-        
+        /* only care about 16-bit subtype / length versions */
         if ((uint8 *)&bcm_event->bcm_hdr < pktend) {
                 uint8 short_subtype = *(uint8 *)&bcm_event->bcm_hdr;
                 if (!(short_subtype & 0x80)) {
@@ -250,20 +267,21 @@ is_wlc_event_frame_tmp(void *pktdata, uint pktlen, uint16 exp_usr_subtype,
                 }
         }
 
-        
+        /* must have both ether_header and bcmeth_hdr */
         if (pktlen < OFFSETOF(bcm_event_t, event)) {
                 err = BCME_BADLEN;
                 goto done;
         }
 
-        
-        len = ntoh16_ua((void *)&bcm_event->bcm_hdr.length);
-        if (((uint8 *)&bcm_event->bcm_hdr.version + len) > pktend) {
+        /* check length in bcmeth_hdr */
+        evlen = ntoh16_ua((void *)&bcm_event->bcm_hdr.length);
+        evend = (uint8 *)&bcm_event->bcm_hdr.version + evlen;
+        if (evend != pktend) {
                 err = BCME_BADLEN;
                 goto done;
         }
 
-        
+        /* match on subtype, oui and usr subtype for BRCM events */
         subtype = ntoh16_ua((void *)&bcm_event->bcm_hdr.subtype);
         if (subtype != BCMILCP_SUBTYPE_VENDOR_LONG) {
                 err = BCME_NOTFOUND;
@@ -275,16 +293,18 @@ is_wlc_event_frame_tmp(void *pktdata, uint pktlen, uint16 exp_usr_subtype,
                 goto done;
         }
 
-        
+        /* if it is a bcm_event or bcm_dngl_event_t, validate it */
         usr_subtype = ntoh16_ua((void *)&bcm_event->bcm_hdr.usr_subtype);
         switch (usr_subtype) {
         case BCMILCP_BCM_SUBTYPE_EVENT:
-                if (pktlen < sizeof(bcm_event_t)) {
+                if ((pktlen < sizeof(bcm_event_t)) ||
+                        (evend < ((uint8 *)bcm_event + sizeof(bcm_event_t)))) {
                         err = BCME_BADLEN;
                         goto done;
                 }
-                len = sizeof(bcm_event_t) + ntoh32_ua((void *)&bcm_event->event.datalen);
-                if ((uint8 *)pktdata + len > pktend) {
+                data_len = ntoh32_ua((void *)&bcm_event->event.datalen);
+                if ((sizeof(bcm_event_t) + data_len +
+                        BCMILCP_BCM_SUBTYPE_EVENT_DATA_PAD) != pktlen) {
                         err = BCME_BADLEN;
                         goto done;
                 }
@@ -295,21 +315,23 @@ is_wlc_event_frame_tmp(void *pktdata, uint pktlen, uint16 exp_usr_subtype,
                 }
 
                 if (out_event) {
-                        
+                        /* ensure BRCM event pkt aligned */
                         memcpy(&out_event->event, &bcm_event->event, sizeof(wl_event_msg_t));
                 }
 
                 break;
 #ifdef HEALTH_CHECK
         case BCMILCP_BCM_SUBTYPE_DNGLEVENT:
-                if (pktlen < sizeof(bcm_dngl_event_t)) {
+                if (pktlen < sizeof(bcm_dngl_event_t) ||
+                        (evend < ((uint8 *)bcm_event + sizeof(bcm_dngl_event_t)))) {
                         err = BCME_BADLEN;
                         goto done;
                 }
 
-                len = sizeof(bcm_dngl_event_t) +
-                        ntoh16_ua((void *)&((bcm_dngl_event_t *)pktdata)->dngl_event.datalen);
-                if ((uint8 *)pktdata + len > pktend) {
+                data_len = ntoh16_ua((void *)&((bcm_dngl_event_t *)pktdata)
+                        ->dngl_event.datalen);
+                if ((sizeof(bcm_dngl_event_t) + data_len +
+                        BCMILCP_BCM_SUBTYPE_EVENT_DATA_PAD) != pktlen) {
                         err = BCME_BADLEN;
                         goto done;
                 }
@@ -320,13 +342,13 @@ is_wlc_event_frame_tmp(void *pktdata, uint pktlen, uint16 exp_usr_subtype,
                 }
 
                 if (out_event) {
-                        
+                        /* ensure BRCM dngl event pkt aligned */
                         memcpy(&out_event->dngl_event, &((bcm_dngl_event_t *)pktdata)->dngl_event,
                                 sizeof(bcm_dngl_event_msg_t));
                 }
 
                 break;
-#endif 
+#endif /* HEALTH_CHECK */
         default:
                 err = BCME_NOTFOUND;
                 goto done;

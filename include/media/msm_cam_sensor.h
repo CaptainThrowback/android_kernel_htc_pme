@@ -2,14 +2,18 @@
 #define __LINUX_MSM_CAM_SENSOR_H
 
 #include <uapi/media/msm_cam_sensor.h>
+#include <uapi/media/msm_camsensor_sdk.h>
 
 #include <linux/compat.h>
 
+/*HTC_START, HTC_VCM, Harvey 20130628 - Porting read OTP*/
 #define MAX_ACT_NAME_SIZE_32 32
-#define LC898214_HEX_MAX_32 0x7FFF 
-#define LC898214_HEX_MIN_32 0x8001 
+#define LC898214_HEX_MAX_32 0x7FFF //0x6A00
+#define LC898214_HEX_MIN_32 0x8001 //0x9600
 #define LC898214_DEC_MAX_32 1023
+/*HTC_END, HTC_VCM*/
 
+/*HTC_START, HTC_VCM, Harvey 20130628 - Porting read OTP*/
 struct fuse_id32{
 	uint32_t fuse_id_word1;
 	uint32_t fuse_id_word2;
@@ -18,7 +22,7 @@ struct fuse_id32{
 };
 
 typedef struct{
-	char    ACT_NAME[MAX_ACT_NAME_SIZE_32]; 
+	char    ACT_NAME[MAX_ACT_NAME_SIZE_32]; /*HTC Harvey 20130701 - Set otp af value*/
 	uint8_t VCM_START_MSB;
 	uint8_t VCM_START_LSB;
 	uint8_t AF_INF_MSB;
@@ -36,7 +40,9 @@ typedef struct{
 	uint8_t ACT_ID;
 	uint32_t MODULE_ID_AB;
 }af_value_t32;
+/*HTC_END, HTC_VCM*/
 
+/* HTC_START Read Defect Pixel */
 struct pixel_tt32 {
 	int   x;
 	int   y;
@@ -46,30 +52,35 @@ struct pixels_array_tt32 {
 	struct pixel_tt32 pix[40];
 	int	count;
 };
+/* HTC_END */
 
+/*HTC_START, HTC_VCM, support multiple I2C access type for actuator modulation*/
 enum actuator_I2C_func_select32 {
         WRITE_SEQ_TABLE_32,
         WRITE_TABLE_W_MICRODELAY_32,
         WRITE_MULTI_TABLE_32
 };
+/*HTC_END, HTC_VCM*/
 
+/*HTC_START, HTC_VCM, Harvey 20130701 - Set otp af value*/
 struct msm_actuator_af_OTP_info_t32 {
         uint8_t VCM_OTP_Read;
         uint16_t VCM_Start;
         uint16_t VCM_Infinity;
         uint16_t VCM_Macro;
-        
+        /* HTC_START pg 20130220 lc898212 act enable */
         uint8_t VCM_Bias;
         uint8_t VCM_Offset;
         uint16_t VCM_Bottom_Mech;
         uint16_t VCM_Top_Mech;
         uint8_t VCM_Vendor_Id_Version;
-        
+        /* HTC_END pg 20130220 lc898212 act enable */
         uint8_t VCM_Vendor;
         uint8_t act_id;
         char act_name[MAX_SENSOR_NAME];
         uint32_t MODULE_ID_AB;
 };
+/*HTC_END, HTC_VCM*/
 
 
 #ifdef CONFIG_COMPAT
@@ -107,6 +118,7 @@ struct msm_camera_sensor_slave_info32 {
 	uint8_t  is_init_params_valid;
 	struct msm_sensor_init_params sensor_init_params;
 	enum msm_sensor_output_format_t output_format;
+	uint8_t bypass_video_node_creation;
 };
 
 struct msm_camera_csid_lut_params32 {
@@ -137,6 +149,16 @@ struct csid_cfg_data32 {
 		compat_uptr_t csid_params;
 		compat_uptr_t csid_testmode_params;
 	} cfg;
+};
+
+struct msm_ir_led_cfg_data_t32 {
+	enum msm_ir_led_cfg_type_t cfg_type;
+	int32_t pwm_duty_on_ns;
+	int32_t pwm_period_ns;
+};
+
+struct msm_ir_cut_cfg_data_t32 {
+	enum msm_ir_cut_cfg_type_t cfg_type;
 };
 
 struct eeprom_read_t32 {
@@ -207,17 +229,19 @@ struct msm_actuator_params_t32 {
 	compat_uptr_t reg_tbl_params;
 	compat_uptr_t init_settings;
 	struct park_lens_data_t park_lens;
-	
+	/*HTC_START, HTC_VCM*/
 	char ACT_NAME[MAX_ACT_NAME_SIZE_32];
-	
+	/*HTC_END, HTC_VCM*/
 };
 
 struct msm_actuator_set_info_t32 {
 	struct msm_actuator_params_t32 actuator_params;
 	struct msm_actuator_tuning_params_t32 af_tuning_params;
+/*HTC_START, HTC_VCM, for actuator modulation*/
 	uint8_t enable_focus_step_log;
-	compat_uptr_t step_position_table;                
-	enum actuator_I2C_func_select32 act_i2c_select; 
+	compat_uptr_t step_position_table;                //Move step position table to user space
+	enum actuator_I2C_func_select32 act_i2c_select; //support multiple I2C access type
+/*HTC_END, HTC_VCM*/
 };
 
 struct sensor_init_cfg_data32 {
@@ -241,18 +265,18 @@ struct msm_actuator_move_params_t32 {
 struct msm_actuator_cfg_data32 {
 	int cfgtype;
 	uint8_t is_af_supported;
-	
+	/*HTC_START*/
 	uint32_t ois_gain;
-	
+	/*HTC_END*/
 	union {
 		struct msm_actuator_move_params_t32 move;
 		struct msm_actuator_set_info_t32 set_info;
 		struct msm_actuator_get_info_t get_info;
 		struct msm_actuator_set_position_t setpos;
 		enum af_camera_name cam_name;
-		
+		/*HTC_START, HTC_VCM, Harvey 20130701 - Set otp af value*/
 		af_value_t32 af_value;
-		
+		/*HTC_END, HTC_VCM*/
 	} cfg;
 };
 
@@ -266,26 +290,26 @@ struct csiphy_cfg_data32 {
 
 struct sensorb_cfg_data32 {
 	int cfgtype;
-	
+	/*HTC_START, HTC_VCM, Harvey 20130628 - Porting read OTP*/
 	int8_t sensor_ver;
 	int8_t lens_id;
 	af_value_t32 af_value;
-	
+	/*HTC_END, HTC_VCM*/
 	union {
 		struct msm_sensor_info_t      sensor_info;
 		struct msm_sensor_init_params sensor_init_params;
 		compat_uptr_t                 setting;
 		struct msm_sensor_i2c_sync_params sensor_i2c_sync_params;
-		
+		/*HTC_START, HTC_VCM, Harvey 20130628 - Porting read OTP*/
 		struct fuse_id32 fuse;
-		
+		/*HTC_END, HTC_VCM*/
 	} cfg;
-	
+	//HTC_START, Gyro calibration
 	int cam_id;
-	
-	
+	//HTC_END
+	//HTC_START, read defect piexl
 	struct pixels_array_tt32 pixels_array;
-	
+	//HTC_END
 };
 
 struct msm_ois_params_t32 {
@@ -351,6 +375,12 @@ struct msm_flash_cfg_data_t32 {
 
 #define VIDIOC_MSM_FLASH_CFG32 \
 	_IOWR('V', BASE_VIDIOC_PRIVATE + 13, struct msm_flash_cfg_data_t32)
+
+#define VIDIOC_MSM_IR_LED_CFG32 \
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 14, struct msm_ir_led_cfg_data_t32)
+
+#define VIDIOC_MSM_IR_CUT_CFG32 \
+	_IOWR('V', BASE_VIDIOC_PRIVATE + 15, struct msm_ir_cut_cfg_data_t32)
 #endif
 
 #endif

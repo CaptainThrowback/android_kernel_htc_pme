@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -22,6 +22,7 @@
 #include <linux/notifier.h>
 #include <linux/irqreturn.h>
 #include <linux/kref.h>
+#include <linux/kthread.h>
 
 #include "mdss.h"
 #include "mdss_mdp_hwio.h"
@@ -50,12 +51,14 @@
 #define VALID_MDP_WB_INTF_FORMAT BIT(1)
 #define VALID_MDP_CURSOR_FORMAT BIT(2)
 
-#define C3_ALPHA	3	
-#define C2_R_Cr		2	
-#define C1_B_Cb		1	
-#define C0_G_Y		0	
+#define C3_ALPHA	3	/* alpha */
+#define C2_R_Cr		2	/* R/Cr */
+#define C1_B_Cb		1	/* B/Cb */
+#define C0_G_Y		0	/* G/luma */
 
-#define KOFF_TIMEOUT msecs_to_jiffies(1000)
+/* wait for 1 second for unexpected irq missing */
+#define KOFF_TIMEOUT_MS 1000
+#define KOFF_TIMEOUT msecs_to_jiffies(KOFF_TIMEOUT_MS)
 
 #define OVERFETCH_DISABLE_TOP		BIT(0)
 #define OVERFETCH_DISABLE_BOTTOM	BIT(1)
@@ -85,6 +88,7 @@
 
 #define MAX_LAYER_COUNT		0xC
 
+/* hw cursor can only be setup in highest mixer stage */
 #define HW_CURSOR_STAGE(mdata) \
 	(((mdata)->max_target_zorder + MDSS_MDP_STAGE_0) - 1)
 
@@ -110,6 +114,12 @@ enum mdss_mdp_mixer_mux {
 	MDSS_MDP_MIXER_MUX_DEFAULT,
 	MDSS_MDP_MIXER_MUX_LEFT,
 	MDSS_MDP_MIXER_MUX_RIGHT,
+};
+
+enum mdss_sd_transition {
+	SD_TRANSITION_NONE,
+	SD_TRANSITION_SECURE_TO_NON_SECURE,
+	SD_TRANSITION_NON_SECURE_TO_SECURE
 };
 
 static inline enum mdss_mdp_sspp_index get_pipe_num_from_ndx(u32 ndx)
@@ -187,9 +197,13 @@ enum mdss_mdp_csc_type {
 	MDSS_MDP_CSC_YUV2RGB_601L,
 	MDSS_MDP_CSC_YUV2RGB_601FR,
 	MDSS_MDP_CSC_YUV2RGB_709L,
+	MDSS_MDP_CSC_YUV2RGB_2020L,
+	MDSS_MDP_CSC_YUV2RGB_2020FR,
 	MDSS_MDP_CSC_RGB2YUV_601L,
 	MDSS_MDP_CSC_RGB2YUV_601FR,
 	MDSS_MDP_CSC_RGB2YUV_709L,
+	MDSS_MDP_CSC_RGB2YUV_2020L,
+	MDSS_MDP_CSC_RGB2YUV_2020FR,
 	MDSS_MDP_CSC_YUV2YUV,
 	MDSS_MDP_CSC_RGB2RGB,
 	MDSS_MDP_MAX_CSC
@@ -219,6 +233,14 @@ enum mdss_mdp_fetch_type {
 	MDSS_MDP_FETCH_UBWC,
 };
 
+/**
+ * enum mdp_commit_stage_type - Indicate different commit stages
+ *
+ * @MDP_COMMIT_STATE_WAIT_FOR_PINGPONG:	At the stage of being ready to
+*			wait for pingpong buffer.
+ * @MDP_COMMIT_STATE_PINGPONG_DONE:		At the stage that pingpong
+ *			buffer is ready.
+ */
 enum mdp_commit_stage_type {
 	MDP_COMMIT_STAGE_SETUP_DONE,
 	MDP_COMMIT_STAGE_READY_FOR_KICKOFF,
@@ -258,6 +280,21 @@ enum mdp_wb_blk_caps {
 	MDSS_MDP_WB_UBWC = BIT(3),
 };
 
+/**
+ * enum perf_calc_vote_mode - enum to decide if mdss_mdp_get_bw_vote_mode
+ *		function needs an extra efficiency factor.
+ *
+ * @PERF_CALC_VOTE_MODE_PER_PIPE: used to check if efficiency factor is needed
+ *		based on the pipe properties.
+ * @PERF_CALC_VOTE_MODE_CTL: used to check if efficiency factor is needed based
+ *		on the controller properties.
+ * @PERF_CALC_VOTE_MODE_MAX: used to check if efficiency factor is need to vote
+ *		max MDP bandwidth.
+ *
+ * Depending upon the properties of each specific object (determined
+ * by this enum), driver decides if the mode to vote needs an
+ * extra factor.
+ */
 enum perf_calc_vote_mode {
 	PERF_CALC_VOTE_MODE_PER_PIPE,
 	PERF_CALC_VOTE_MODE_CTL,
@@ -291,6 +328,7 @@ struct mdss_mdp_ctl_intfs_ops {
 	int (*prepare_fnc)(struct mdss_mdp_ctl *ctl, void *arg);
 	int (*display_fnc)(struct mdss_mdp_ctl *ctl, void *arg);
 	int (*wait_fnc)(struct mdss_mdp_ctl *ctl, void *arg);
+	int (*wait_vsync_fnc)(struct mdss_mdp_ctl *ctl);
 	int (*wait_pingpong)(struct mdss_mdp_ctl *ctl, void *arg);
 	u32 (*read_line_cnt_fnc)(struct mdss_mdp_ctl *);
 	int (*add_vsync_handler)(struct mdss_mdp_ctl *,
@@ -301,13 +339,194 @@ struct mdss_mdp_ctl_intfs_ops {
 	int (*restore_fnc)(struct mdss_mdp_ctl *ctl, bool locked);
 	int (*early_wake_up_fnc)(struct mdss_mdp_ctl *ctl);
 
+	/*
+	 * reconfigure interface for new resolution, called before (pre=1)
+	 * and after interface has been reconfigured (pre=0)
+	 */
 	int (*reconfigure)(struct mdss_mdp_ctl *ctl,
 			enum dynamic_switch_modes mode, bool pre);
-	
+	/* called before do any register programming  from commit thread */
 	void (*pre_programming)(struct mdss_mdp_ctl *ctl);
 
-	
+	/* to update lineptr, [1..yres] - enable, 0 - disable */
 	int (*update_lineptr)(struct mdss_mdp_ctl *ctl, bool enable);
+};
+
+/* FRC info used for Deterministic Frame Rate Control */
+#define FRC_CADENCE_22_RATIO 2000000000u /* 30fps -> 60fps, 29.97 -> 59.94 */
+#define FRC_CADENCE_22_RATIO_LOW 1940000000u
+#define FRC_CADENCE_22_RATIO_HIGH 2060000000u
+
+#define FRC_CADENCE_23_RATIO 2500000000u /* 24fps -> 60fps, 23.976 -> 59.94 */
+#define FRC_CADENCE_23_RATIO_LOW 2450000000u
+#define FRC_CADENCE_23_RATIO_HIGH 2550000000u
+
+#define FRC_CADENCE_23223_RATIO 2400000000u /* 25fps -> 60fps */
+#define FRC_CADENCE_23223_RATIO_LOW 2360000000u
+#define FRC_CADENCE_23223_RATIO_HIGH 2440000000u
+
+#define FRC_VIDEO_TS_DELTA_THRESHOLD_US (16666 * 10) /* 10 frames at 60fps */
+
+/*
+ * In current FRC design, the minimum video fps change we can support is 24fps
+ * to 25fps, so the timestamp delta per frame is 1667. Use this threshold to
+ * catch this case and ignore more trivial video fps variations.
+ */
+#define FRC_VIDEO_FPS_CHANGE_THRESHOLD_US 1667
+#define FRC_VIDEO_FPS_DETECT_WINDOW 32 /* how many samples we need for video
+				fps calculation */
+
+/*
+ * Experimental value. Mininum vsync counts during video's single update could
+ * be thought of as pause. If video fps is 10fps and display is 60fps, every
+ * video frame should arrive per 6 vsync, and add 2 more vsync delay, each frame
+ * should arrive in at most 8 vsync interval, otherwise it's considered as a
+ * pause. This value might need tuning in some cases.
+ */
+#define FRC_VIDEO_PAUSE_THRESHOLD 8
+
+#define FRC_MAX_VIDEO_DROPPING_CNT 10 /* how many drops before we disable FRC */
+#define FRC_VIDEO_DROP_TOLERANCE_WINDOW 1000 /* how many frames to count drop */
+
+/* DONOT change the definition order. __check_known_cadence depends on it */
+enum {
+	FRC_CADENCE_NONE = 0, /* Waiting for samples to compute cadence */
+	FRC_CADENCE_23,
+	FRC_CADENCE_22,
+	FRC_CADENCE_23223,
+	FRC_CADENCE_FREE_RUN, /* No extra repeat, but wait for changes */
+	FRC_CADENCE_DISABLE, /* FRC disabled, no extra repeat */
+};
+#define FRC_MAX_SUPPORT_CADENCE FRC_CADENCE_FREE_RUN
+
+#define FRC_CADENCE_SEQUENCE_MAX_LEN 5 /* 5 -> 23223 */
+#define FRC_CADENCE_SEQUENCE_MAX_RETRY 5 /* max retry of matching sequence */
+
+/* sequence generator for pre-defined cadence */
+struct mdss_mdp_frc_seq_gen {
+	int seq[FRC_CADENCE_SEQUENCE_MAX_LEN];
+	int cache[FRC_CADENCE_SEQUENCE_MAX_LEN]; /* 0 -> this slot is empty */
+	int len;
+	int pos; /* current position in seq, < 0 -> pattern not matched */
+	int base;
+	int retry;
+};
+
+struct mdss_mdp_frc_data {
+	u32 frame_cnt; /* video frame count */
+	s64 timestamp; /* video timestamp in millisecond */
+};
+
+struct mdss_mdp_frc_video_stat {
+	u32 frame_cnt; /* video frame count */
+	s64 timestamp; /* video timestamp in millisecond */
+	s64 last_delta;
+};
+
+struct mdss_mdp_frc_drop_stat {
+	u32 drop_cnt; /* how many video buffer drop */
+	u32 frame_cnt; /* the first frame cnt where drop happens */
+};
+
+#define FRC_CADENCE_DETECT_WINDOW 6 /* how many samples at least we need for
+					cadence detection */
+
+struct mdss_mdp_frc_cadence_calc {
+	struct mdss_mdp_frc_data samples[FRC_CADENCE_DETECT_WINDOW];
+	int sample_cnt;
+};
+
+struct mdss_mdp_frc_info {
+	u32 cadence_id; /* patterns such as 22/23/23223 */
+	u32 display_fp1000s;
+	u32 last_vsync_cnt; /* vsync when we kicked off last frame */
+	u32 last_repeat; /* how many times last frame was repeated */
+	u32 base_vsync_cnt;
+	struct mdss_mdp_frc_data cur_frc;
+	struct mdss_mdp_frc_data last_frc;
+	struct mdss_mdp_frc_data base_frc;
+	struct mdss_mdp_frc_video_stat video_stat;
+	struct mdss_mdp_frc_drop_stat drop_stat;
+	struct mdss_mdp_frc_cadence_calc calc;
+	struct mdss_mdp_frc_seq_gen gen;
+};
+
+/*
+ * FSM used in deterministic frame rate control:
+ *
+ *                +----------------+                      +----------------+
+ *                | +------------+ |    too many drops    | +------------+ |
+ *       +--------> |  INIT      | +----------------------> |   DISABLE  | |
+ *       |        | +------------+ <-----------+          | +------------+ |
+ *       |        +----------------+           |          +----------------+
+ *       |           |        |                |
+ *       |           |        |                | change
+ *       |      frame|        |change          +----------------+
+ *       |           |        |                                 |
+ *       |           |        |                                 |
+ *       |        +--v--------+----+                      +-----+----------+
+ * change|        |                |      not supported   |                |
+ *       |        | CADENCE_DETECT +---------------------->    FREE_RUN    |
+ *       |        |                |                      |                |
+ *       |        +-------+--------+                      +----------------+
+ *       |                |
+ *       |                |
+ *       |                |cadence detected
+ *       |                |
+ *       |                |
+ *       |        +-------v--------+             +----------------------------+
+ *       |        |                |             |Events:                     |
+ *       +--------+  SEQ_MATCH     |             |  1. change: some changes   |
+ *       |        |                |             |  might change cadence like |
+ *       |        +-------+--------+             |  video/display fps.        |
+ *       |                |                      |  2. frame: video frame with|
+ *       |                |sequence matched      |  correct FRC info.         |
+ *       |                |                      |  3. in other states than   |
+ *       |        +-------v--------+             |  INIT frame event doesn't  |
+ *       |        |                |             |  make any state change.    |
+ *       |        |                |             +----------------------------+
+ *       +--------+   READY        |
+ *                |                |
+ *                +----------------+
+ */
+enum mdss_mdp_frc_state_type {
+	FRC_STATE_INIT = 0, /* INIT state waiting for frames */
+	FRC_STATE_CADENCE_DETECT, /* state to detect cadence ID */
+	FRC_STATE_SEQ_MATCH, /* state to find start pos in cadence sequence */
+	FRC_STATE_FREERUN, /* state has no extra repeat but might be changed */
+	FRC_STATE_READY, /* state ready to do FRC */
+	FRC_STATE_DISABLE, /* state in which FRC is disabled */
+	FRC_STATE_MAX,
+};
+
+struct mdss_mdp_frc_fsm;
+
+struct mdss_mdp_frc_fsm_ops {
+	/* preprocess incoming FRC info like checking fps changes */
+	void (*pre_frc)(struct mdss_mdp_frc_fsm *frc_fsm, void *arg);
+	/* deterministic frame rate control like delaying frame's display */
+	void (*do_frc)(struct mdss_mdp_frc_fsm *frc_fsm, void *arg);
+	/* post-operations after FRC like saving past info */
+	void (*post_frc)(struct mdss_mdp_frc_fsm *frc_fsm, void *arg);
+};
+
+struct mdss_mdp_frc_fsm_cbs {
+	/* callback used once updating FRC FSM's state */
+	void (*update_state_cb)(struct mdss_mdp_frc_fsm *frc_fsm);
+};
+
+struct mdss_mdp_frc_fsm_state {
+	char *name; /* debug name of current state */
+	enum mdss_mdp_frc_state_type state; /* current state type */
+	struct mdss_mdp_frc_fsm_ops ops; /* operations of curent state */
+};
+
+struct mdss_mdp_frc_fsm {
+	bool enable; /* whether FRC is running */
+	struct mdss_mdp_frc_fsm_state state; /* current state */
+	struct mdss_mdp_frc_fsm_state to_state; /* state to set */
+	struct mdss_mdp_frc_fsm_cbs cbs;
+	struct mdss_mdp_frc_info frc_info;
 };
 
 struct mdss_mdp_ctl {
@@ -318,9 +537,13 @@ struct mdss_mdp_ctl {
 	int power_state;
 
 	u32 intf_num;
-	u32 slave_intf_num; 
+	u32 slave_intf_num; /* ping-pong split */
 	u32 intf_type;
 
+	/*
+	 * false: for sctl in DUAL_LM_DUAL_DISPLAY
+	 * true: everything else
+	 */
 	bool is_master;
 
 	u32 opmode;
@@ -342,7 +565,7 @@ struct mdss_mdp_ctl {
 	u16 border_y_off;
 	bool is_secure;
 
-	
+	/* used for WFD */
 	u32 dst_format;
 	enum mdss_mdp_csc_type csc_type;
 	struct mult_factor dst_comp_ratio;
@@ -379,6 +602,24 @@ struct mdss_mdp_ctl {
 
 	struct mdss_mdp_lineptr_handler lineptr_handler;
 
+	/*
+	 * This ROI is aligned to as per following guidelines and
+	 * sent to the panel driver.
+	 *
+	 * 1. DUAL_LM_DUAL_DISPLAY
+	 *    Panel = 1440x2560
+	 *    CTL0 = 720x2560 (LM0=720x2560)
+	 *    CTL1 = 720x2560 (LM1=720x2560)
+	 *    Both CTL's ROI will be (0-719)x(0-2599)
+	 * 2. DUAL_LM_SINGLE_DISPLAY
+	 *    Panel = 1440x2560
+	 *    CTL0 = 1440x2560 (LM0=720x2560 and LM1=720x2560)
+	 *    CTL0's ROI will be (0-1429)x(0-2599)
+	 * 3. SINGLE_LM_SINGLE_DISPLAY
+	 *    Panel = 1080x1920
+	 *    CTL0 = 1080x1920 (LM0=1080x1920)
+	 *    CTL0's ROI will be (0-1079)x(0-1919)
+	 */
 	struct mdss_rect roi;
 	struct mdss_rect roi_bkup;
 
@@ -397,10 +638,13 @@ struct mdss_mdp_ctl {
 	int pending_mode_switch;
 	u16 frame_rate;
 
-	
+	/* dynamic resolution switch during cont-splash handoff */
 	bool switch_with_handoff;
 
-	
+	/* vsync handler for FRC */
+	struct mdss_mdp_vsync_handler frc_vsync_handler;
+
+	/* HTC: */
 	struct mutex event_lock;
 };
 
@@ -424,6 +668,14 @@ struct mdss_mdp_mixer {
 	u16 cursor_hoty;
 	u8 rotator_mode;
 
+	/*
+	 * src_split_req is valid only for right layer mixer.
+	 *
+	 * VIDEO mode panels: Always true if source split is enabled.
+	 * CMD mode panels: Only true if source split is enabled and
+	 *                  for a given commit left and right both ROIs
+	 *                  are valid.
+	 */
 	bool src_split_req;
 	bool is_right_mixer;
 	struct mdss_mdp_ctl *ctl;
@@ -441,15 +693,15 @@ struct mdss_mdp_format_params {
 	u8 chroma_sample;
 	u8 solid_fill;
 	u8 fetch_planes;
-	u8 unpack_align_msb;	
-	u8 unpack_tight;	
-	u8 unpack_count;	
+	u8 unpack_align_msb;	/* 0 to LSB, 1 to MSB */
+	u8 unpack_tight;	/* 0 for loose, 1 for tight */
+	u8 unpack_count;	/* 0 = 1 component, 1 = 2 component ... */
 	u8 bpp;
-	u8 alpha_enable;	
+	u8 alpha_enable;	/*  source has alpha */
 	u8 fetch_mode;
 	u8 bits[MAX_PLANES];
 	u8 element[MAX_PLANES];
-	u8 unpack_dx_format;	
+	u8 unpack_dx_format;	/*1 for 10 bit format otherwise 0 */
 };
 
 struct mdss_mdp_format_ubwc_tile_info {
@@ -595,22 +847,39 @@ struct mdss_mdp_shared_reg_ctrl {
 };
 
 enum mdss_mdp_pipe_rect {
-	MDSS_MDP_PIPE_RECT0, 
+	MDSS_MDP_PIPE_RECT0, /* default */
 	MDSS_MDP_PIPE_RECT1,
 	MDSS_MDP_PIPE_MAX_RECTS,
 };
 
+/**
+ * enum mdss_mdp_pipe_multirect_mode - pipe multirect mode
+ * @MDSS_MDP_PIPE_MULTIRECT_NONE:	pipe is not working in multirect mode
+ * @MDSS_MDP_PIPE_MULTIRECT_PARALLEL:	rectangles are being fetched at the
+ *					same time in time multiplexed fashion
+ * @MDSS_MDP_PIPE_MULTIRECT_SERIAL:	rectangles are fetched serially, where
+ *					one is only fetched after the other one
+ *					is complete
+ */
 enum mdss_mdp_pipe_multirect_mode {
 	MDSS_MDP_PIPE_MULTIRECT_NONE,
 	MDSS_MDP_PIPE_MULTIRECT_PARALLEL,
 	MDSS_MDP_PIPE_MULTIRECT_SERIAL,
 };
 
+/**
+ * struct mdss_mdp_pipe_multirect_params - multirect info for layer or pipe
+ * @num:	rectangle being operated, default is RECT0 if pipe doesn't
+ *		support multirect
+ * @mode:	mode of multirect operation, default is NONE
+ * @next:	pointer to sibling pipe/layer which is also operating in
+ *		multirect mode
+ */
 struct mdss_mdp_pipe_multirect_params {
-	enum mdss_mdp_pipe_rect num; 
+	enum mdss_mdp_pipe_rect num; /* RECT0 or RECT1 */
 	int max_rects;
 	enum mdss_mdp_pipe_multirect_mode mode;
-	void *next; 
+	void *next; /* pointer to next pipe or layer */
 };
 
 struct mdss_mdp_pipe {
@@ -635,7 +904,7 @@ struct mdss_mdp_pipe {
 	u32 flags;
 	u32 bwc_mode;
 
-	
+	/* valid only when pipe's output is crossing both layer mixers */
 	bool src_split_req;
 	bool is_right_blend;
 
@@ -648,7 +917,7 @@ struct mdss_mdp_pipe {
 	struct mdss_mdp_format_params *src_fmt;
 	struct mdss_mdp_plane_sizes src_planes;
 
-	
+	/* compression ratio from the source format */
 	struct mult_factor comp_ratio;
 
 	enum mdss_mdp_stage_index mixer_stage;
@@ -723,11 +992,11 @@ struct mdss_overlay_private {
 	bool mixer_swap;
 	u32 resources_state;
 
-	
+	/* list of buffers that can be reused */
 	struct list_head bufs_chunks;
 	struct list_head bufs_pool;
 	struct list_head bufs_used;
-	
+	/* list of buffers which should be freed during cleanup stage */
 	struct list_head bufs_freelist;
 
 	int ad_state;
@@ -740,7 +1009,6 @@ struct mdss_overlay_private {
 
 	struct sw_sync_timeline *vsync_timeline;
 	struct mdss_mdp_vsync_handler vsync_retire_handler;
-	struct work_struct retire_work;
 	int retire_cnt;
 	bool kickoff_released;
 	u32 cursor_ndx[2];
@@ -750,6 +1018,13 @@ struct mdss_overlay_private {
 	u32 ad_bl_events;
 
 	bool allow_kickoff;
+
+	/* video frame info used by deterministic frame rate control */
+	struct mdss_mdp_frc_fsm *frc_fsm;
+	u8 sd_transition_state;
+	struct kthread_worker worker;
+	struct kthread_work vsync_work;
+	struct task_struct *thread;
 
 	void *splash_mem_vaddr;
 	dma_addr_t splash_mem_dma;
@@ -776,11 +1051,29 @@ struct mdss_mdp_commit_cb {
 		void *data);
 };
 
+/**
+ * enum mdss_screen_state - Screen states that MDP can be forced into
+ *
+ * @MDSS_SCREEN_DEFAULT:	Do not force MDP into any screen state.
+ * @MDSS_SCREEN_FORCE_BLANK:	Force MDP to generate blank color fill screen.
+ */
 enum mdss_screen_state {
 	MDSS_SCREEN_DEFAULT,
 	MDSS_SCREEN_FORCE_BLANK,
 };
 
+/**
+ * enum mdss_mdp_clt_intf_event_flags - flags specifying how event to should
+ *                                      be sent to panel drivers.
+ *
+ * @CTL_INTF_EVENT_FLAG_DEFAULT: this flag denotes default behaviour where
+ *                              event will be send to all panels attached this
+ *                              display, recursively in split-DSI.
+ * @CTL_INTF_EVENT_FLAG_SKIP_BROADCAST: this flag sends event only to panel
+ *                                     associated with this ctl.
+ * @CTL_INTF_EVENT_FLAG_SLAVE_INTF: this flag sends event only to slave panel
+ *                                  associated with this ctl, i.e pingpong-split
+ */
 enum mdss_mdp_clt_intf_event_flags {
 	CTL_INTF_EVENT_FLAG_DEFAULT = 0,
 	CTL_INTF_EVENT_FLAG_SKIP_BROADCAST = BIT(1),
@@ -795,6 +1088,13 @@ enum mdss_mdp_clt_intf_event_flags {
 #define mfd_to_wb(mfd) (((struct mdss_overlay_private *)\
 				(mfd->mdp.private1))->wb)
 
+/**
+ * - mdss_mdp_is_roi_changed
+ * @mfd - pointer to mfd
+ *
+ * Function returns true if roi is changed for any layer mixer of a given
+ * display, false otherwise.
+ */
 static inline bool mdss_mdp_is_roi_changed(struct msm_fb_data_type *mfd)
 {
 	struct mdss_mdp_ctl *ctl;
@@ -802,12 +1102,20 @@ static inline bool mdss_mdp_is_roi_changed(struct msm_fb_data_type *mfd)
 	if (!mfd)
 		return false;
 
-	ctl = mfd_to_ctl(mfd); 
+	ctl = mfd_to_ctl(mfd); /* returns master ctl */
 
 	return ctl->mixer_left->roi_changed ||
 	      (is_split_lm(mfd) ? ctl->mixer_right->roi_changed : false);
 }
 
+/**
+ * - mdss_mdp_is_both_lm_valid
+ * @main_ctl - pointer to a main ctl
+ *
+ * Function checks if both layer mixers are active or not. This can be useful
+ * when partial update is enabled on either MDP_DUAL_LM_SINGLE_DISPLAY or
+ * MDP_DUAL_LM_DUAL_DISPLAY .
+ */
 static inline bool mdss_mdp_is_both_lm_valid(struct mdss_mdp_ctl *main_ctl)
 {
 	return (main_ctl && main_ctl->is_master &&
@@ -818,10 +1126,11 @@ static inline bool mdss_mdp_is_both_lm_valid(struct mdss_mdp_ctl *main_ctl)
 enum mdss_mdp_pu_type {
 	MDSS_MDP_INVALID_UPDATE = -1,
 	MDSS_MDP_DEFAULT_UPDATE,
-	MDSS_MDP_LEFT_ONLY_UPDATE,	
-	MDSS_MDP_RIGHT_ONLY_UPDATE,	
+	MDSS_MDP_LEFT_ONLY_UPDATE,	/* only valid for split_lm */
+	MDSS_MDP_RIGHT_ONLY_UPDATE,	/* only valid for split_lm */
 };
 
+/* only call from master ctl */
 static inline enum mdss_mdp_pu_type mdss_mdp_get_pu_type(
 	struct mdss_mdp_ctl *mctl)
 {
@@ -1015,7 +1324,7 @@ static inline struct clk *mdss_mdp_get_clk(u32 clk_idx)
 }
 
 static inline void mdss_update_sd_client(struct mdss_data_type *mdata,
-							bool status)
+							unsigned int status)
 {
 	if (status)
 		atomic_inc(&mdata->sd_client_count);
@@ -1026,8 +1335,22 @@ static inline void mdss_update_sd_client(struct mdss_data_type *mdata,
 static inline int mdss_mdp_get_wb_ctl_support(struct mdss_data_type *mdata,
 							bool rotator_session)
 {
+	/*
+	 * Any control path can be routed to any of the hardware datapaths.
+	 * But there is a HW restriction for 3D Mux block. As the 3D Mux
+	 * settings in the CTL registers are double buffered, if an interface
+	 * uses it and disconnects, then the subsequent interface which gets
+	 * connected should use the same control path in order to clear the
+	 * 3D MUX settings.
+	 * To handle this restriction, we are allowing WB also, to loop through
+	 * all the avialable control paths, so that it can reuse the control
+	 * path left by the external interface, thereby clearing the 3D Mux
+	 * settings.
+	 * The initial control paths can be used by Primary, External and WB.
+	 * The rotator can use the remaining available control paths.
+	 */
 	return rotator_session ? (mdata->nctl - mdata->nmixers_wb) :
-				(mdata->nctl - mdata->nwb);
+		MDSS_MDP_CTL0;
 }
 
 static inline bool mdss_mdp_is_nrt_vbif_client(struct mdss_data_type *mdata,
@@ -1124,6 +1447,11 @@ static inline int mdss_mdp_is_cdm_supported(struct mdss_data_type *mdata,
 {
 	int support = mdata->ncdm;
 
+	/*
+	 * CDM is supported under these conditions
+	 * 1. If Device tree created a cdm block AND
+	 * 2. Output interface is HDMI OR Output interface is WB2
+	 */
 	return support && ((intf_type == MDSS_INTF_HDMI) ||
 			   ((intf_type == MDSS_MDP_NO_INTF) &&
 			    ((mixer_type == MDSS_MDP_MIXER_TYPE_INTF) ||
@@ -1142,12 +1470,34 @@ static inline uint8_t pp_vig_csc_pipe_val(struct mdss_mdp_pipe *pipe)
 		return MDSS_MDP_CSC_YUV2RGB_601L;
 	case MDP_CSC_ITU_R_601_FR:
 		return MDSS_MDP_CSC_YUV2RGB_601FR;
+	case MDP_CSC_ITU_R_2020:
+		return MDSS_MDP_CSC_YUV2RGB_2020L;
+	case MDP_CSC_ITU_R_2020_FR:
+		return MDSS_MDP_CSC_YUV2RGB_2020FR;
 	case MDP_CSC_ITU_R_709:
 	default:
 		return  MDSS_MDP_CSC_YUV2RGB_709L;
 	}
 }
 
+/*
+ * when split_lm topology is used without 3D_Mux, either DSC_MERGE or
+ * split_panel is used during full frame updates. Now when we go from
+ * full frame update to right-only update, we need to disable DSC_MERGE or
+ * split_panel. However, those are controlled through DSC0_COMMON_MODE
+ * register which is double buffered, and this double buffer update is tied to
+ * LM0. Now for right-only update, LM0 will not get double buffer update signal.
+ * So DSC_MERGE or split_panel is not disabled for right-only update which is
+ * a wrong HW state and leads ping-pong timeout. Workaround for this is to use
+ * LM0->DSC0 pair for right-only update and disable DSC_MERGE or split_panel.
+ *
+ * However using LM0->DSC0 pair for right-only update requires many changes
+ * at various levels of SW. To lower the SW impact and still support
+ * right-only partial update, keep SW state as it is but swap mixer register
+ * writes such that we instruct HW to use LM0->DSC0 pair.
+ *
+ * This function will return true if such a swap is needed or not.
+ */
 static inline bool mdss_mdp_is_lm_swap_needed(struct mdss_data_type *mdata,
 	struct mdss_mdp_ctl *mctl)
 {
@@ -1215,6 +1565,9 @@ static inline bool mdss_mdp_is_map_needed(struct mdss_data_type *mdata,
 {
 	u32 is_secure_ui = data->flags & MDP_SECURE_DISPLAY_OVERLAY_SESSION;
 
+     /*
+      * For ULT Targets we need SMMU Map, to issue map call for secure Display.
+      */
 	if (is_secure_ui && !mdss_has_quirk(mdata, MDSS_QUIRK_NEED_SECURE_MAP))
 		return false;
 
@@ -1274,7 +1627,8 @@ unsigned long mdss_mdp_get_clk_rate(u32 clk_idx, bool locked);
 int mdss_mdp_vsync_clk_enable(int enable, bool locked);
 void mdss_mdp_clk_ctrl(int enable);
 struct mdss_data_type *mdss_mdp_get_mdata(void);
-int mdss_mdp_secure_display_ctrl(unsigned int enable);
+int mdss_mdp_secure_display_ctrl(struct mdss_data_type *mdata,
+	unsigned int enable);
 
 int mdss_mdp_overlay_init(struct msm_fb_data_type *mfd);
 int mdss_mdp_dfps_update_params(struct msm_fb_data_type *mfd,
@@ -1448,7 +1802,8 @@ int mdss_mdp_argc_config(struct msm_fb_data_type *mfd,
 int mdss_mdp_hist_lut_config(struct msm_fb_data_type *mfd,
 			struct mdp_hist_lut_data *config, u32 *copyback);
 int mdss_mdp_pp_default_overlay_config(struct msm_fb_data_type *mfd,
-					struct mdss_panel_data *pdata);
+					struct mdss_panel_data *pdata,
+					bool enable);
 int mdss_mdp_dither_config(struct msm_fb_data_type *mfd,
 			struct mdp_dither_cfg_data *config, u32 *copyback,
 			   int copy_from_kernel);
@@ -1600,6 +1955,12 @@ void mdss_mdp_disable_hw_irq(struct mdss_data_type *mdata);
 
 void mdss_mdp_set_supported_formats(struct mdss_data_type *mdata);
 
+void mdss_mdp_frc_fsm_init_state(struct mdss_mdp_frc_fsm *frc_fsm);
+void mdss_mdp_frc_fsm_change_state(struct mdss_mdp_frc_fsm *frc_fsm,
+	enum mdss_mdp_frc_state_type state,
+	void (*cb)(struct mdss_mdp_frc_fsm *frc_fsm));
+void mdss_mdp_frc_fsm_update_state(struct mdss_mdp_frc_fsm *frc_fsm);
+
 #ifdef CONFIG_FB_MSM_MDP_NONE
 struct mdss_data_type *mdss_mdp_get_mdata(void)
 {
@@ -1615,5 +1976,5 @@ void mdss_mdp_free_layer_pp_info(struct mdp_input_layer *layer)
 {
 }
 
-#endif 
-#endif 
+#endif /* CONFIG_FB_MSM_MDP_NONE */
+#endif /* MDSS_MDP_H */

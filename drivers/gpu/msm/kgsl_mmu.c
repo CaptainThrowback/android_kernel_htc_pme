@@ -1,4 +1,4 @@
-/* Copyright (c) 2002,2007-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2002,2007-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -321,7 +321,7 @@ kgsl_mmu_createpagetableobject(struct kgsl_mmu *mmu, unsigned int name)
 	list_add(&pagetable->list, &kgsl_driver.pagetable_list);
 	spin_unlock_irqrestore(&kgsl_driver.ptlock, flags);
 
-	
+	/* Create the sysfs entries */
 	pagetable_add_sysfs_objects(pagetable);
 
 	return pagetable;
@@ -333,6 +333,14 @@ void kgsl_mmu_putpagetable(struct kgsl_pagetable *pagetable)
 }
 EXPORT_SYMBOL(kgsl_mmu_putpagetable);
 
+/**
+ * kgsl_mmu_find_svm_region() - Find a empty spot in the SVM region
+ * @pagetable: KGSL pagetable to search
+ * @start: start of search range, must be within kgsl_mmu_svm_range()
+ * @end: end of search range, must be within kgsl_mmu_svm_range()
+ * @size: Size of the region to find
+ * @align: Desired alignment of the address
+ */
 uint64_t kgsl_mmu_find_svm_region(struct kgsl_pagetable *pagetable,
 		uint64_t start, uint64_t end, uint64_t size,
 		uint64_t align)
@@ -343,6 +351,12 @@ uint64_t kgsl_mmu_find_svm_region(struct kgsl_pagetable *pagetable,
 	return -ENOMEM;
 }
 
+/**
+ * kgsl_mmu_set_svm_region() - Check if a region is empty and reserve it if so
+ * @pagetable: KGSL pagetable to search
+ * @gpuaddr: GPU address to check/reserve
+ * @size: Size of the region to check/reserve
+ */
 int kgsl_mmu_set_svm_region(struct kgsl_pagetable *pagetable, uint64_t gpuaddr,
 		uint64_t size)
 {
@@ -352,6 +366,11 @@ int kgsl_mmu_set_svm_region(struct kgsl_pagetable *pagetable, uint64_t gpuaddr,
 	return -ENOMEM;
 }
 
+/**
+ * kgsl_mmu_get_gpuaddr() - Assign a GPU address to the memdesc
+ * @pagetable: GPU pagetable to assign the address in
+ * @memdesc: mem descriptor to assign the memory to
+ */
 int
 kgsl_mmu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 		struct kgsl_memdesc *memdesc)
@@ -372,7 +391,7 @@ kgsl_mmu_map(struct kgsl_pagetable *pagetable,
 
 	if (!memdesc->gpuaddr)
 		return -EINVAL;
-	
+	/* Only global mappings should be mapped multiple times */
 	if (!kgsl_memdesc_is_global(memdesc) &&
 		(KGSL_MEMDESC_MAPPED & memdesc->priv))
 		return -EINVAL;
@@ -395,20 +414,44 @@ kgsl_mmu_map(struct kgsl_pagetable *pagetable,
 }
 EXPORT_SYMBOL(kgsl_mmu_map);
 
-void kgsl_mmu_put_gpuaddr(struct kgsl_pagetable *pagetable,
-		struct kgsl_memdesc *memdesc)
+/**
+ * kgsl_mmu_put_gpuaddr() - Remove a GPU address from a pagetable
+ * @pagetable: Pagetable to release the memory from
+ * @memdesc: Memory descriptor containing the GPU address to free
+ */
+void kgsl_mmu_put_gpuaddr(struct kgsl_memdesc *memdesc)
 {
+	struct kgsl_pagetable *pagetable = memdesc->pagetable;
+	int unmap_fail = 0;
+
 	if (memdesc->size == 0 || memdesc->gpuaddr == 0)
 		return;
 
-	if (PT_OP_VALID(pagetable, put_gpuaddr))
-		pagetable->pt_ops->put_gpuaddr(pagetable, memdesc);
+	if (!kgsl_memdesc_is_global(memdesc))
+		unmap_fail = kgsl_mmu_unmap(pagetable, memdesc);
+
+	/*
+	 * Do not free the gpuaddr/size if unmap fails. Because if we
+	 * try to map this range in future, the iommu driver will throw
+	 * a BUG_ON() because it feels we are overwriting a mapping.
+	*/
+	if (PT_OP_VALID(pagetable, put_gpuaddr) && (unmap_fail == 0))
+		pagetable->pt_ops->put_gpuaddr(memdesc);
 
 	if (!kgsl_memdesc_is_global(memdesc))
 		memdesc->gpuaddr = 0;
+
+	memdesc->pagetable = NULL;
 }
 EXPORT_SYMBOL(kgsl_mmu_put_gpuaddr);
 
+/**
+ * kgsl_mmu_svm_range() - Return the range for SVM (if applicable)
+ * @pagetable: Pagetable to query the range from
+ * @lo: Pointer to store the start of the SVM range
+ * @hi: Pointer to store the end of the SVM range
+ * @memflags: Flags from the buffer we are mapping
+ */
 int kgsl_mmu_svm_range(struct kgsl_pagetable *pagetable,
 		uint64_t *lo, uint64_t *hi, uint64_t memflags)
 {
@@ -481,12 +524,12 @@ void kgsl_mmu_remove_global(struct kgsl_device *device,
 EXPORT_SYMBOL(kgsl_mmu_remove_global);
 
 void kgsl_mmu_add_global(struct kgsl_device *device,
-		struct kgsl_memdesc *memdesc)
+		struct kgsl_memdesc *memdesc, const char *name)
 {
 	struct kgsl_mmu *mmu = &device->mmu;
 
 	if (MMU_OP_VALID(mmu, mmu_add_global))
-		mmu->mmu_ops->mmu_add_global(mmu, memdesc);
+		mmu->mmu_ops->mmu_add_global(mmu, memdesc, name);
 }
 EXPORT_SYMBOL(kgsl_mmu_add_global);
 
@@ -526,6 +569,11 @@ struct kgsl_memdesc *kgsl_mmu_get_qdss_global_entry(struct kgsl_device *device)
 }
 EXPORT_SYMBOL(kgsl_mmu_get_qdss_global_entry);
 
+/*
+ * NOMMU defintions - NOMMU really just means that the MMU is kept in pass
+ * through and the GPU directly accesses physical memory. Used in debug mode and
+ * when a real MMU isn't up and running yet.
+ */
 
 static bool nommu_gpuaddr_in_range(struct kgsl_pagetable *pagetable,
 		uint64_t gpuaddr)
@@ -544,7 +592,12 @@ static int nommu_get_gpuaddr(struct kgsl_pagetable *pagetable,
 
 	memdesc->gpuaddr = (uint64_t) sg_phys(memdesc->sgt->sgl);
 
-	return memdesc->gpuaddr != 0 ? 0 : -ENOMEM;
+	if (memdesc->gpuaddr) {
+		memdesc->pagetable = pagetable;
+		return 0;
+	}
+
+	return -ENOMEM;
 }
 
 static struct kgsl_mmu_pt_ops nommu_pt_ops = {
@@ -553,7 +606,7 @@ static struct kgsl_mmu_pt_ops nommu_pt_ops = {
 };
 
 static void nommu_add_global(struct kgsl_mmu *mmu,
-		struct kgsl_memdesc *memdesc)
+		struct kgsl_memdesc *memdesc, const char *name)
 {
 	memdesc->gpuaddr = (uint64_t) sg_phys(memdesc->sgt->sgl);
 }
@@ -595,7 +648,7 @@ static int nommu_init(struct kgsl_mmu *mmu)
 
 static int nommu_probe(struct kgsl_device *device)
 {
-	
+	/* NOMMU always exists */
 	return 0;
 }
 

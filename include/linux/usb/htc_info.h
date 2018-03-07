@@ -33,6 +33,13 @@
 	printk(KERN_INFO "[USB] " fmt, ## args)
 #define USB_DEBUG(fmt, args...) \
 	printk(KERN_DEBUG "[USB] " fmt, ## args)
+/*
+#ifdef pr_debug
+#undef pr_debug
+#endif
+#define pr_debug(fmt, args...) \
+	printk(KERN_INFO "[USB] " pr_fmt(fmt), ## args)
+*/
 #ifdef pr_warn
 #undef pr_warn
 #endif
@@ -51,6 +58,21 @@
 #define pr_info(fmt, args...) \
 	printk(KERN_INFO "[USB] " pr_fmt(fmt), ## args)
 
+#if defined(CONFIG_ANALOGIX_7688)
+enum anx7688_prop {
+	ANX_DROLE = 0,
+	ANX_PROLE,
+	ANX_PMODE,
+	ANX_PROLE_CHANGE,
+	ANX_VCONN,
+	ANX_START_HOST_FLAG,	// 7418 only
+	ANX_EMARKER,			// 7418 only
+	ANX_NON_STANDARD,		// 7418 only
+	ANX_PD_CAP,
+	ANX_FW_VERSION,			// 7418 only
+};
+#endif
+
 void ufp_switch_usb_speed(int on);
 
-#endif 
+#endif /* __HTC_INFO__ */

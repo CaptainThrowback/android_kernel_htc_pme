@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -29,7 +29,11 @@
 #include <media/videobuf2-dma-contig.h>
 #include <media/msmb_camera.h>
 
-#define MSM_POST_EVT_TIMEOUT 6500
+/* Setting MAX timeout to 10seconds considering
+ * backend will operate @ .6fps in certain usecases
+ * like Long exposure usecase and isp needs max of 2 frames
+ * to stop the hardware which will be around 3 seconds*/
+#define MSM_POST_EVT_TIMEOUT 10000
 #define MSM_POST_EVT_NOTIMEOUT 0xFFFFFFFF
 #define MSM_CAMERA_STREAM_CNT_BITS  32
 
@@ -50,6 +54,10 @@ struct msm_queue_head {
 	int max;
 };
 
+/** msm_event:
+ *
+ *  event sent by imaging server
+ **/
 struct msm_event {
 	struct video_device *vdev;
 	atomic_t on_heap;
@@ -61,6 +69,13 @@ struct msm_command {
 	atomic_t on_heap;
 };
 
+/** struct msm_command_ack
+ *
+ *  Object of command_ack_q, which is
+ *  created per open operation
+ *
+ *  contains struct msm_command
+ **/
 struct msm_command_ack {
 	struct list_head list;
 	struct msm_queue_head command_q;
@@ -69,24 +84,33 @@ struct msm_command_ack {
 };
 
 struct msm_v4l2_subdev {
+	/* FIXME: for session close and error handling such
+	 * as daemon shutdown */
 	int    close_sequence;
 };
 
 struct msm_session {
 	struct list_head list;
 
-	
+	/* session index */
 	unsigned int session_id;
 
-	
+	/* event queue sent by imaging server */
 	struct msm_event event_q;
 
+	/* ACK by imaging server. Object type of
+	 * struct msm_command_ack per open,
+	 * assumption is application can send
+	 * command on every opened video node */
 	struct msm_queue_head command_ack_q;
 
+	/* real streams(either data or metadate) owned by one
+	 * session struct msm_stream */
 	struct msm_queue_head stream_q;
 	struct mutex lock;
 	struct mutex lock_q;
-        struct mutex close_lock;
+	struct mutex close_lock;
+	rwlock_t stream_rwlock;
 };
 
 static inline bool msm_is_daemon_present(void)
@@ -104,15 +128,17 @@ int msm_create_stream(unsigned int session_id,
 void msm_delete_stream(unsigned int session_id, unsigned int stream_id);
 int  msm_create_command_ack_q(unsigned int session_id, unsigned int stream_id);
 void msm_delete_command_ack_q(unsigned int session_id, unsigned int stream_id);
-struct msm_stream *msm_get_stream(unsigned int session_id,
+struct msm_session *msm_get_session(unsigned int session_id);
+struct msm_stream *msm_get_stream(struct msm_session *session,
 	unsigned int stream_id);
 struct vb2_queue *msm_get_stream_vb2q(unsigned int session_id,
 	unsigned int stream_id);
 struct msm_stream *msm_get_stream_from_vb2q(struct vb2_queue *q);
+struct msm_session *msm_get_session_from_vb2q(struct vb2_queue *q);
 struct msm_session *msm_session_find(unsigned int session_id);
 #ifdef CONFIG_COMPAT
 long msm_copy_camera_private_ioctl_args(unsigned long arg,
 	struct msm_camera_private_ioctl_arg *k_ioctl,
 	void __user **tmp_compat_ioctl_ptr);
 #endif
-#endif 
+#endif /*_MSM_H */

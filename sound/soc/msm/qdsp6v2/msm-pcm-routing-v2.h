@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,6 +17,7 @@
 #define LPASS_BE_PRI_I2S_TX "PRIMARY_I2S_TX"
 #define LPASS_BE_SLIMBUS_0_RX "SLIMBUS_0_RX"
 #define LPASS_BE_SLIMBUS_0_TX "SLIMBUS_0_TX"
+#define LPASS_BE_SLIMBUS_2_TX "SLIMBUS_2_TX"
 #define LPASS_BE_HDMI "HDMI"
 #define LPASS_BE_INT_BT_SCO_RX "INT_BT_SCO_RX"
 #define LPASS_BE_INT_BT_SCO_TX "INT_BT_SCO_TX"
@@ -42,7 +43,7 @@
 
 #define LPASS_BE_MI2S_RX "MI2S_RX"
 #define LPASS_BE_MI2S_TX "MI2S_TX"
-#define LPASS_BE_QUAT_MI2S "QUAT_MI2S" 
+#define LPASS_BE_QUAT_MI2S "QUAT_MI2S" /* HTC_AUD */
 #define LPASS_BE_QUAT_MI2S_RX "QUAT_MI2S_RX"
 #define LPASS_BE_QUAT_MI2S_TX "QUAT_MI2S_TX"
 #define LPASS_BE_SEC_MI2S_RX "SEC_MI2S_RX"
@@ -134,7 +135,13 @@
 #define LPASS_BE_QUAT_TDM_TX_6 "QUAT_TDM_TX_6"
 #define LPASS_BE_QUAT_TDM_RX_7 "QUAT_TDM_RX_7"
 #define LPASS_BE_QUAT_TDM_TX_7 "QUAT_TDM_TX_7"
+#define LPASS_BE_AFE_LOOPBACK_TX "AFE_LOOPBACK_TX"
 
+/* For multimedia front-ends, asm session is allocated dynamically.
+ * Hence, asm session/multimedia front-end mapping has to be maintained.
+ * Due to this reason, additional multimedia front-end must be placed before
+ * non-multimedia front-ends.
+ */
 
 enum {
 	MSM_FRONTEND_DAI_MULTIMEDIA1 = 0,
@@ -153,6 +160,11 @@ enum {
 	MSM_FRONTEND_DAI_MULTIMEDIA14,
 	MSM_FRONTEND_DAI_MULTIMEDIA15,
 	MSM_FRONTEND_DAI_MULTIMEDIA16,
+	MSM_FRONTEND_DAI_MULTIMEDIA17,
+	MSM_FRONTEND_DAI_MULTIMEDIA18,
+	MSM_FRONTEND_DAI_MULTIMEDIA19,
+	MSM_FRONTEND_DAI_MULTIMEDIA20,
+	MSM_FRONTEND_DAI_MULTIMEDIA21,
 	MSM_FRONTEND_DAI_CS_VOICE,
 	MSM_FRONTEND_DAI_VOIP,
 	MSM_FRONTEND_DAI_AFE_RX,
@@ -178,8 +190,8 @@ enum {
 	MSM_FRONTEND_DAI_MAX,
 };
 
-#define MSM_FRONTEND_DAI_MM_SIZE (MSM_FRONTEND_DAI_MULTIMEDIA16 + 1)
-#define MSM_FRONTEND_DAI_MM_MAX_ID MSM_FRONTEND_DAI_MULTIMEDIA16
+#define MSM_FRONTEND_DAI_MM_SIZE (MSM_FRONTEND_DAI_MULTIMEDIA21 + 1)
+#define MSM_FRONTEND_DAI_MM_MAX_ID MSM_FRONTEND_DAI_MULTIMEDIA21
 
 enum {
 	MSM_BACKEND_DAI_PRI_I2S_RX = 0,
@@ -300,6 +312,8 @@ enum {
 	MSM_BACKEND_DAI_QUAT_TDM_RX_7,
 	MSM_BACKEND_DAI_QUAT_TDM_TX_7,
 	MSM_BACKEND_DAI_INT_BT_A2DP_RX,
+	MSM_BACKEND_DAI_SLIMBUS_2_TX,
+	MSM_BACKEND_DAI_AFE_LOOPBACK_TX,
 	MSM_BACKEND_DAI_MAX,
 };
 
@@ -341,20 +355,23 @@ struct msm_pcm_routing_evt {
 };
 
 struct msm_pcm_routing_bdai_data {
-	u16 port_id; 
-	u8 active; 
-	unsigned long fe_sessions; 
-	u64 port_sessions; 
+	u16 port_id; /* AFE port ID */
+	u8 active; /* track if this backend is enabled */
+	unsigned long fe_sessions; /* Front-end sessions */
+	u64 port_sessions; /* track Tx BE ports -> Rx BE
+			    * number of BE should not exceed
+			    * the size of this field
+			    */
 	unsigned int  sample_rate;
 	unsigned int  channel;
 	unsigned int  format;
-	u32 compr_passthr_mode;
+	u32 passthr_mode[MSM_FRONTEND_DAI_MAX];
 	char *name;
 };
 
 struct msm_pcm_routing_fdai_data {
-	u16 be_srate; 
-	int strm_id; 
+	u16 be_srate; /* track prior backend sample rate for flushing purpose */
+	int strm_id; /* ASM stream ID */
 	int perf_mode;
 	struct msm_pcm_routing_evt event_info;
 };
@@ -372,6 +389,7 @@ struct msm_pcm_stream_app_type_cfg {
 	int sample_rate;
 };
 
+/* HTC_AUD_START */
 struct htc_adm_effect_s {
 	u16 used;
 	u16 port_id;
@@ -386,9 +404,24 @@ enum HTC_ADM_EFFECT_ID {
 	HTC_ADM_EFFECT_ONEDOTONE,
 	HTC_ADM_EFFECT_ONEDOTONE_MUTE,
 	HTC_ADM_EFFECT_ONEDOTONE_RAMPING,
+	HTC_ADM_EFFECT_ONEDOTONE_LIMITER,
+#ifdef CONFIG_USE_AS_HS
+	HTC_ADM_EFFECT_AS_DATA1,/* as_conf_left_im */
+	HTC_ADM_EFFECT_AS_DATA2,/* as_conf_left_re */
+	HTC_ADM_EFFECT_AS_DATA3,/* as_conf_right_im */
+	HTC_ADM_EFFECT_AS_DATA4,/* as_conf_right_re */
+	HTC_ADM_EFFECT_AS_DATA5,/* as_limiter_conf */
+	HTC_ADM_EFFECT_AS_DATA6,/* as_limiter_enable */
+	HTC_ADM_EFFECT_AS_DATA7,/* as_enable */
+#endif
 	HTC_ADM_EFFECT_MAX,
 };
+/* HTC_AUD_END */
 
+/* dai_id: front-end ID,
+ * dspst_id:  DSP audio stream ID
+ * stream_type: playback or capture
+ */
 int msm_pcm_routing_reg_phy_stream(int fedai_id, int perf_mode, int dspst_id,
 				   int stream_type);
 void msm_pcm_routing_reg_psthr_stream(int fedai_id, int dspst_id,
@@ -417,7 +450,4 @@ void msm_pcm_routing_reg_stream_app_type_cfg(int fedai_id, int app_type,
 			int acdb_dev_id, int sample_rate, int session_type);
 int msm_pcm_routing_get_stream_app_type_cfg(int fedai_id, int session_type,
 			int *app_type, int *acdb_dev_id, int *sample_rate);
-int htc_adm_effect_control(enum HTC_ADM_EFFECT_ID effect_id, u16 port_id, uint32_t copp_id,
-					uint32_t payload_size, void *payload);
-ushort get_adm_custom_effect_status(void);
-#endif 
+#endif /*_MSM_PCM_H*/

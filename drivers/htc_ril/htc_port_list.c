@@ -22,10 +22,13 @@
 #include <linux/htc_flags.h>
 #include <soc/qcom/smem.h>
 
+//Sync from mach/msm_iomap.h
 #define IOMEM(x)     (x)
-#define MSM_SHARED_RAM_BASE    IOMEM(0x86300000)       
+#define MSM_SHARED_RAM_BASE    IOMEM(0x86300000)       /*  1M  */
 #define MSM8952_MSM_SHARED_RAM_PHYS     0x86300000
 
+// In qct new release (after 8974) it forces to use 256k as segment size.
+// So we need always enable this flag.
 #define PACKET_FILTER_UDP
 
 static struct mutex port_lock;
@@ -51,7 +54,7 @@ static struct miscdevice portlist_misc = {
 	.name = "htc-portlist",
 };
 
-static int ril_debug_flag = 0;
+static int ril_debug_flag = 0;//enable for debug
 
 #define PF_LOG_DBG(fmt, ...) do {                           \
 		if (ril_debug_flag)                                 \
@@ -250,7 +253,7 @@ static void update_port_list(void)
 			port_list_enable(0);
 	}
 
-	#ifdef PACKET_FILTER_UDP
+#ifdef PACKET_FILTER_UDP
 	count = 0;
 	list_for_each(listptr, &curr_port_list_udp.list) {
 		entry = list_entry(listptr, struct p_list, list);
@@ -272,7 +275,7 @@ static void update_port_list(void)
 		else
 			port_list_enable_udp(0);
 	}
-	#endif
+#endif
 }
 
 static struct p_list *add_list(int no)
@@ -370,6 +373,10 @@ static void remove_list_udp(int no)
 			break;
 		}
 	}
+	/*
+	if (!get_list)
+		PF_LOG_INFO("[Port list] UDP port[%d] failed to remove. Port number is not in list!\n", no);
+	*/
 }
 #endif
 
@@ -377,26 +384,29 @@ static int allocate_port_list(void)
 {
 	uint32_t port_list_phy_addr;
 
-	#if defined PACKET_FILTER_UDP
+#if defined PACKET_FILTER_UDP
 	port_list = smem_alloc(SMEM_ID_VENDOR2, sizeof(uint16_t)*256, 0, SMEM_ANY_HOST_FLAG);
-	#else
+#else
 	port_list = smem_alloc(SMEM_ID_VENDOR2, sizeof(uint16_t)*128, 0, SMEM_ANY_HOST_FLAG);
-	#endif
+#endif
 
 	port_list_phy_addr = (uint32_t)MSM8952_MSM_SHARED_RAM_PHYS + ((uint32_t)(uintptr_t)port_list - (uint32_t)MSM_SHARED_RAM_BASE);
 	if (port_list == NULL) {
+		/*
+		PF_LOG_INFO("[Port list] Error: Cannot allocate port_list in SMEM_ID_VENDOR2\n");
+		*/
 		return -1;
 	} else {
 		PF_LOG_INFO("[Port list] Virtual Address of port_list: [%p]\n", port_list);
 		PF_LOG_INFO("[Port list] Physical Address of port_list: [%X]\n", port_list_phy_addr);
 
 		port_list[0] = packet_filter_flag;
-		#ifdef PACKET_FILTER_UDP
+#ifdef PACKET_FILTER_UDP
 		port_list_udp = port_list + 128;
 		port_list_udp[0] = packet_filter_flag;
 		PF_LOG_INFO("[Port list] Address of port_list: [%p]\n", port_list);
 		PF_LOG_INFO("[Port list] Address of port_list_udp: [%p]\n", port_list_udp);
-		#endif
+#endif
 		return 0;
 	}
 }
@@ -425,7 +435,7 @@ int add_or_remove_port(struct sock *sk, int add_or_remove)
 	if (!packet_filter_flag) {
 		return 0;
 	}
-	
+	/* Check port list memory allocation */
 	if (port_list == NULL) {
 		if(allocate_port_list()!=0) {
 			return 0;
@@ -443,12 +453,12 @@ int add_or_remove_port(struct sock *sk, int add_or_remove)
 			return 0;
 	}
 
-	
+	/* if TCP packet and source IP != 127.0.0.1 */
 	if (sk->sk_protocol == IPPROTO_TCP && src != 0x0100007F && srcp != 0) {
 		int err = 0;
 		wake_lock(&port_suspend_lock);
 		mutex_lock(&port_lock);
-		PF_LOG_INFO("[Port list] TCP port#: [%d]\n", srcp);
+		PF_LOG_INFO("[Port list] %s TCP port#: [%d]\n", add_or_remove?"Add":"Remove", srcp);
 
 		if (add_or_remove) {
 			struct p_list *plist = NULL;
@@ -474,8 +484,9 @@ int add_or_remove_port(struct sock *sk, int add_or_remove)
 	}
 
 #ifdef PACKET_FILTER_UDP
-	
+	/* UDP */
 	if (sk->sk_protocol == IPPROTO_UDP && src != 0x0100007F && srcp != 0) {
+		PF_LOG_INFO("[Port list] %s UTP port#: [%d]\n", add_or_remove?"Add":"Remove", srcp);
 		wake_lock(&port_suspend_lock);
 		mutex_lock(&port_lock);
 		port_updated = 0;
@@ -522,7 +533,7 @@ int update_port_list_charging_state(int enable)
 		else
 			port_list_enable(0);
 	}
-	#ifdef PACKET_FILTER_UDP
+#ifdef PACKET_FILTER_UDP
 	if (usb_enable) {
 		port_list_enable_udp(0);
 	} else {
@@ -535,7 +546,7 @@ int update_port_list_charging_state(int enable)
 		else
 			port_list_enable_udp(0);
 	}
-	#endif
+#endif
 	mutex_unlock(&port_lock);
 	wake_unlock(&port_suspend_lock);
 	return 0;
@@ -550,21 +561,21 @@ static int __init port_list_init(void)
 
 	PF_LOG_INFO("[Port list] init()\n");
 
-	
+	/* Print log only when debug flag (6) to 0x400000 */
 	if (get_kernel_flag() & KERNEL_FLAG_RIL_DBG_MEMCPY)
 		ril_debug_flag = 1;
 
-	
+	/* initial TCP port list linked-list struct */
 	memset(&curr_port_list, 0, sizeof(curr_port_list));
 	INIT_LIST_HEAD(&curr_port_list.list);
 
-	#ifdef PACKET_FILTER_UDP
-	
+#ifdef PACKET_FILTER_UDP
+	/* initial UDP port list linked-list struct */
 	memset(&curr_port_list_udp, 0, sizeof(curr_port_list_udp));
 	INIT_LIST_HEAD(&curr_port_list_udp.list);
-	#endif
+#endif
 
-	
+	/* Check port list memory allocation */
 	allocate_port_list();
 
 	ret = misc_register(&portlist_misc);
@@ -625,12 +636,12 @@ static void __exit port_list_exit(void)
 		entry = list_entry(listptr, struct p_list, list);
 		kfree(entry);
 	}
-	#ifdef PACKET_FILTER_UDP
+#ifdef PACKET_FILTER_UDP
 	list_for_each(listptr, &curr_port_list_udp.list) {
 		entry = list_entry(listptr, struct p_list, list);
 		kfree(entry);
 	}
-	#endif
+#endif
 }
 
 late_initcall(port_list_init);

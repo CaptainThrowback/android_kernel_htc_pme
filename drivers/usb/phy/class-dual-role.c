@@ -46,6 +46,7 @@ static struct device_attribute dual_role_attrs[] = {
 	DUAL_ROLE_ATTR(power_role),
 	DUAL_ROLE_ATTR(data_role),
 	DUAL_ROLE_ATTR(powers_vconn),
+	DUAL_ROLE_ATTR(partner_supports_usb_pd),
 };
 
 struct class *dual_role_class;
@@ -240,25 +241,36 @@ void *dual_role_get_drvdata(struct dual_role_phy_instance *dual_role)
 }
 EXPORT_SYMBOL_GPL(dual_role_get_drvdata);
 
+/***************** Device attribute functions **************************/
 
+/* port type */
 static char *supported_modes_text[] = {
 	"ufp dfp", "dfp", "ufp"
 };
 
+/* current mode */
 static char *mode_text[] = {
 	"ufp", "dfp", "none"
 };
 
+/* Power role */
 static char *pr_text[] = {
 	"source", "sink", "none"
 };
 
+/* Data role */
 static char *dr_text[] = {
 	"host", "device", "none"
 };
 
+/* Vconn supply */
 static char *vconn_supply_text[] = {
 	"n", "y"
+};
+
+/* Port partner supports PD */
+static char *partner_supports_usb_pd_text[] = {
+	"no", "yes"
 };
 
 static ssize_t dual_role_show_property(struct device *dev,
@@ -325,7 +337,15 @@ static ssize_t dual_role_show_property(struct device *dev,
 					vconn_supply_text[value]);
 		else
 			return -EIO;
-	} else
+	} else if (off == DUAL_ROLE_PROP_PARTNER_SUPPORTS_USB_PD) {
+		BUILD_BUG_ON(DUAL_ROLE_PROP_PARTNER_SUPPORTS_USB_PD_TOTAL !=
+				ARRAY_SIZE(partner_supports_usb_pd_text));
+		if (value < DUAL_ROLE_PROP_PARTNER_SUPPORTS_USB_PD_TOTAL)
+			return snprintf(buf, PAGE_SIZE, "%s\n",
+					partner_supports_usb_pd_text[value]);
+		else
+			return -EIO;
+	}
 		return -EIO;
 }
 
@@ -499,6 +519,7 @@ out:
 	return ret;
 }
 
+/******************* Module Init ***********************************/
 
 static int __init dual_role_class_init(void)
 {
